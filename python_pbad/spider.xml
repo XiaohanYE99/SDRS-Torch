@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  9-link spider robot: body (box) + 4 legs × 2 capsule segments.
+  Total DOF: 6 (root free) + 8 (hinge) = 14.
+  Coordinate system: X=forward, Y=up (gravity=-Y), Z=right.
+  Python sim uses the same: world verts are (x,y,z), gravity on component index 1 (=Y).
+
+  Each leg segment is a capsule (pill / stadium solid) with 96 vertices.
+  Capsule local center is offset so that y=0 corresponds to the joint
+  attachment point (top of the segment), ensuring adjacent links are
+  visually and physically connected at their shared joint.
+
+  Ground is lowered slightly so the feet start a few cm above the top face; gravity
+  brings the robot onto the ground within a short run (root y=0.32 unchanged).
+  Ground box top: center_y + y_half = -0.30 + 0.25 = -0.05 (≈6 cm below feet at ~0.01).
+-->
+<robot name="spider">
+
+  <!-- ================= GROUND ================= -->
+  <ground friction="0.8">
+    <!-- Top face y = -0.05: small air gap so a few sim steps settle onto contact -->
+    <box x_half="5.0" y_half="0.25" z_half="5.0" center="0.0 -0.30 0.0"/>
+  </ground>
+
+  <!-- ================= LINKS ================= -->
+  <link name="body">
+    <mass>1.0</mass>
+    <box x_half="0.15" y_half="0.03" z_half="0.08"/>
+  </link>
+
+  <!-- Front-Left leg -->
+  <link name="upper_leg_FL">
+    <mass>0.1</mass>
+    <capsule radius="0.02" half_height="0.08" center="0 -0.08 0" n_verts="96"/>
+  </link>
+  <link name="lower_leg_FL">
+    <mass>0.05</mass>
+    <capsule radius="0.015" half_height="0.06" center="0 -0.06 0" n_verts="96"/>
+  </link>
+
+  <!-- Front-Right leg -->
+  <link name="upper_leg_FR">
+    <mass>0.1</mass>
+    <capsule radius="0.02" half_height="0.08" center="0 -0.08 0" n_verts="96"/>
+  </link>
+  <link name="lower_leg_FR">
+    <mass>0.05</mass>
+    <capsule radius="0.015" half_height="0.06" center="0 -0.06 0" n_verts="96"/>
+  </link>
+
+  <!-- Back-Left leg -->
+  <link name="upper_leg_BL">
+    <mass>0.1</mass>
+    <capsule radius="0.02" half_height="0.08" center="0 -0.08 0" n_verts="96"/>
+  </link>
+  <link name="lower_leg_BL">
+    <mass>0.05</mass>
+    <capsule radius="0.015" half_height="0.06" center="0 -0.06 0" n_verts="96"/>
+  </link>
+
+  <!-- Back-Right leg -->
+  <link name="upper_leg_BR">
+    <mass>0.1</mass>
+    <capsule radius="0.02" half_height="0.08" center="0 -0.08 0" n_verts="96"/>
+  </link>
+  <link name="lower_leg_BR">
+    <mass>0.05</mass>
+    <capsule radius="0.015" half_height="0.06" center="0 -0.06 0" n_verts="96"/>
+  </link>
+
+  <!-- ================= JOINTS ================= -->
+
+  <!-- Root: 6-DOF free joint; feet slightly above ground top (see ground box). -->
+  <joint name="root" type="free">
+    <parent>world</parent>
+    <child>body</child>
+    <initial_pos>0.0 0.32 0.0</initial_pos>
+  </joint>
+
+  <!-- Front-Left hip & knee -->
+  <joint name="hip_FL" type="hinge">
+    <parent>body</parent>
+    <child>upper_leg_FL</child>
+    <origin>0.12 -0.03 0.06</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-1.2" upper="1.2"/>
+  </joint>
+  <joint name="knee_FL" type="hinge">
+    <parent>upper_leg_FL</parent>
+    <child>lower_leg_FL</child>
+    <origin>0.0 -0.16 0.0</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-1.5" upper="0.1"/>
+  </joint>
+
+  <!-- Front-Right hip & knee -->
+  <joint name="hip_FR" type="hinge">
+    <parent>body</parent>
+    <child>upper_leg_FR</child>
+    <origin>0.12 -0.03 -0.06</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-1.2" upper="1.2"/>
+  </joint>
+  <joint name="knee_FR" type="hinge">
+    <parent>upper_leg_FR</parent>
+    <child>lower_leg_FR</child>
+    <origin>0.0 -0.16 0.0</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-1.5" upper="0.1"/>
+  </joint>
+
+  <!-- Back-Left hip & knee -->
+  <joint name="hip_BL" type="hinge">
+    <parent>body</parent>
+    <child>upper_leg_BL</child>
+    <origin>-0.12 -0.03 0.06</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-1.2" upper="1.2"/>
+  </joint>
+  <joint name="knee_BL" type="hinge">
+    <parent>upper_leg_BL</parent>
+    <child>lower_leg_BL</child>
+    <origin>0.0 -0.16 0.0</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-1.5" upper="0.1"/>
+  </joint>
+
+  <!-- Back-Right hip & knee -->
+  <joint name="hip_BR" type="hinge">
+    <parent>body</parent>
+    <child>upper_leg_BR</child>
+    <origin>-0.12 -0.03 -0.06</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-1.2" upper="1.2"/>
+  </joint>
+  <joint name="knee_BR" type="hinge">
+    <parent>upper_leg_BR</parent>
+    <child>lower_leg_BR</child>
+    <origin>0.0 -0.16 0.0</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-1.5" upper="0.1"/>
+  </joint>
+
+</robot>

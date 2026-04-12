@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MuJoCo reference ant (OpenAI Gym style): same topology, fromto, joint axes, ranges.
+
+  ``frame="mj_zup"``: positions / directions / fromto use MuJoCo (X,Y horizontal, Z up);
+  loader maps to engine Y-up as (x,y,z)_engine = (x_mj, z_mj, y_mj).
+
+  Hinge ``limit`` widened to ±π (调试：暂不按 MJ 度限位); 正式仿真可改回 ±30°/踝区间。
+  ``initial_pos`` is in MuJoCo frame: root translation (0,0,z) matches init_qpos height;
+  raised slightly so the hull clears the ground box top at θ=0.
+-->
+<robot name="ant" frame="mj_zup">
+
+  <ground friction="0.8">
+    <box x_half="5.0" y_half="0.25" z_half="5.0" center="0.0 -0.30 0.0"/>
+  </ground>
+
+  <!-- torso: MJ sphere size 0.25 → capsule r=hh=0.25 along +Y (engine) -->
+  <link name="torso">
+    <mass>3.5</mass>
+    <capsule radius="0.25" half_height="0.25" center="0 0 0" n_verts="96"/>
+  </link>
+
+  <!-- front_left_leg: aux_1_geom -->
+  <link name="front_left_leg">
+    <mass>0.1</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 0.2 0.2 0.0" n_verts="96"/>
+  </link>
+  <link name="aux_1_fl">
+    <mass>0.35</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 0.2 0.2 0.0" n_verts="96"/>
+  </link>
+  <link name="foot_fl">
+    <mass>0.02</mass>
+    <box x_half="0.004" y_half="0.004" z_half="0.004"/>
+  </link>
+  <link name="tip_fl">
+    <mass>0.25</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 0.4 0.4 0.0" n_verts="96"/>
+  </link>
+
+  <!-- front_right_leg -->
+  <link name="front_right_leg">
+    <mass>0.1</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 -0.2 0.2 0.0" n_verts="96"/>
+  </link>
+  <link name="aux_1_fr">
+    <mass>0.35</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 -0.2 0.2 0.0" n_verts="96"/>
+  </link>
+  <link name="foot_fr">
+    <mass>0.02</mass>
+    <box x_half="0.004" y_half="0.004" z_half="0.004"/>
+  </link>
+  <link name="tip_fr">
+    <mass>0.25</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 -0.4 0.4 0.0" n_verts="96"/>
+  </link>
+
+  <!-- back_leg -->
+  <link name="back_leg">
+    <mass>0.1</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 -0.2 -0.2 0.0" n_verts="96"/>
+  </link>
+  <link name="aux_1_bl">
+    <mass>0.35</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 -0.2 -0.2 0.0" n_verts="96"/>
+  </link>
+  <link name="foot_bl">
+    <mass>0.02</mass>
+    <box x_half="0.004" y_half="0.004" z_half="0.004"/>
+  </link>
+  <link name="tip_bl">
+    <mass>0.25</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 -0.4 -0.4 0.0" n_verts="96"/>
+  </link>
+
+  <!-- right_back_leg -->
+  <link name="right_back_leg">
+    <mass>0.1</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 0.2 -0.2 0.0" n_verts="96"/>
+  </link>
+  <link name="aux_1_br">
+    <mass>0.35</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 0.2 -0.2 0.0" n_verts="96"/>
+  </link>
+  <link name="foot_br">
+    <mass>0.02</mass>
+    <box x_half="0.004" y_half="0.004" z_half="0.004"/>
+  </link>
+  <link name="tip_br">
+    <mass>0.25</mass>
+    <capsule radius="0.08" fromto="0.0 0.0 0.0 0.4 -0.4 0.0" n_verts="96"/>
+  </link>
+
+  <!-- initial_pos 第三量为 MJ 的 z → 引擎 Y；地面顶约 Y=-0.05；取较低使约 20×dt≈0.2s 内可触地 -->
+  <!-- 根 ZYX yaw=π：绕世界竖直轴转 180°，局部 +Y（胶囊默认朝上）→ 世界 −Y，脚朝下（重力 −Y） -->
+  <joint name="root" type="free">
+    <parent>world</parent>
+    <child>torso</child>
+    <initial_pos>0.0 0.0 0.80</initial_pos>
+    <initial_euler roll="0" pitch="0" yaw="3.141592653589793"/>
+  </joint>
+
+  <joint name="fix_torso_fl" type="fixed">
+    <parent>torso</parent>
+    <child>front_left_leg</child>
+    <origin>0 0 0</origin>
+  </joint>
+  <joint name="fix_fl_aux" type="fixed">
+    <parent>front_left_leg</parent>
+    <child>aux_1_fl</child>
+    <origin>0.2 0.2 0</origin>
+  </joint>
+  <joint name="hip_1" type="hinge">
+    <parent>aux_1_fl</parent>
+    <child>foot_fl</child>
+    <origin>0.2 0.2 0</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+  <joint name="ankle_1" type="hinge">
+    <parent>foot_fl</parent>
+    <child>tip_fl</child>
+    <origin>0 0 0</origin>
+    <axis>-1 1 0</axis>
+    <limit lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+
+  <joint name="fix_torso_fr" type="fixed">
+    <parent>torso</parent>
+    <child>front_right_leg</child>
+    <origin>0 0 0</origin>
+  </joint>
+  <joint name="fix_fr_aux" type="fixed">
+    <parent>front_right_leg</parent>
+    <child>aux_1_fr</child>
+    <origin>-0.2 0.2 0</origin>
+  </joint>
+  <joint name="hip_2" type="hinge">
+    <parent>aux_1_fr</parent>
+    <child>foot_fr</child>
+    <origin>-0.2 0.2 0</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+  <joint name="ankle_2" type="hinge">
+    <parent>foot_fr</parent>
+    <child>tip_fr</child>
+    <origin>0 0 0</origin>
+    <axis>1 1 0</axis>
+    <limit lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+
+  <joint name="fix_torso_bl" type="fixed">
+    <parent>torso</parent>
+    <child>back_leg</child>
+    <origin>0 0 0</origin>
+  </joint>
+  <joint name="fix_bl_aux" type="fixed">
+    <parent>back_leg</parent>
+    <child>aux_1_bl</child>
+    <origin>-0.2 -0.2 0</origin>
+  </joint>
+  <joint name="hip_3" type="hinge">
+    <parent>aux_1_bl</parent>
+    <child>foot_bl</child>
+    <origin>-0.2 -0.2 0</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+  <joint name="ankle_3" type="hinge">
+    <parent>foot_bl</parent>
+    <child>tip_bl</child>
+    <origin>0 0 0</origin>
+    <axis>-1 1 0</axis>
+    <limit lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+
+  <joint name="fix_torso_br" type="fixed">
+    <parent>torso</parent>
+    <child>right_back_leg</child>
+    <origin>0 0 0</origin>
+  </joint>
+  <joint name="fix_br_aux" type="fixed">
+    <parent>right_back_leg</parent>
+    <child>aux_1_br</child>
+    <origin>0.2 -0.2 0</origin>
+  </joint>
+  <joint name="hip_4" type="hinge">
+    <parent>aux_1_br</parent>
+    <child>foot_br</child>
+    <origin>0.2 -0.2 0</origin>
+    <axis>0 0 1</axis>
+    <limit lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+  <joint name="ankle_4" type="hinge">
+    <parent>foot_br</parent>
+    <child>tip_br</child>
+    <origin>0 0 0</origin>
+    <axis>1 1 0</axis>
+    <limit lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+
+  <!-- 前髋负向使前腿下摆；后髋约 +0.52 与前髋约 -1.05 相差 ≈ π/2；踝取中段以伸直小腿 -->
+  <initial_hinge joint="hip_1" value="-1.05"/>
+  <initial_hinge joint="hip_2" value="-1.05"/>
+  <initial_hinge joint="hip_3" value="0.52"/>
+  <initial_hinge joint="hip_4" value="0.52"/>
+  <initial_hinge joint="ankle_1" value="0.95"/>
+  <initial_hinge joint="ankle_2" value="-0.95"/>
+  <initial_hinge joint="ankle_3" value="-0.95"/>
+  <initial_hinge joint="ankle_4" value="0.95"/>
+
+</robot>

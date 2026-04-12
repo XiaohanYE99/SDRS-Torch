@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  两根链条，每根 10 个链节；链节为 0.3×0.3×0.5 长方体（宽×厚×长，长沿局部 -Y 下垂）。
+  坐标系与本项目一致：X、Z 水平，Y 向上，重力 -Y；地面顶面 Y=0。
+
+  用户给定起点（若为 x,y,z 且 z 表示高度）映射为仿真 (x, height, z)：
+    链1 固定点 (0, 0, 0.5) → (0, 0.5, 0)
+    链2：若用 (1, 0, 1.5) → (1, 1.5, 0)，两链在 X 上相距 1m，竖直悬垂时通常碰不到。
+    为实现「第二根压在第一根上」，第二根锚点与第一根共线（同 X、Z），仅更高： (0, 1.5, 0)。
+    若要坚持 X=1，把 b_root 的 origin 改为「1 1.5 0」并依赖大角度摆动或改初始角。
+
+  Hinge 绕子连杆坐标原点旋转；原点放在每节顶端，box 用 center 将几何下移，使顶端铰接、
+  链节沿 -Y 延伸 0.5。
+
+  说明：XML 仅支持单轴 hinge（1 自由度），链条在过锚点的竖直面内摆动；两根链 X 错开、
+  第二根更高，下落时第二根会叠在第一根上方区域。
+-->
+<robot name="two_chains">
+
+  <ground friction="0.8">
+    <box x_half="8.0" y_half="0.25" z_half="8.0" center="0.0 -0.25 0.0"/>
+  </ground>
+
+  <!-- 链节几何：半长 0.25（总长 0.5），横截面半宽 0.15（总 0.3） -->
+  <!-- center 使盒子在局部 Y∈[-0.5,0]，原点 = 顶端铰接点 -->
+
+  <!-- ========== 链 A：10 节 ========== -->
+  <link name="a0"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="a1"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="a2"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="a3"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="a4"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="a5"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="a6"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="a7"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="a8"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="a9"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+
+  <!-- ========== 链 B：10 节 ========== -->
+  <link name="b0"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="b1"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="b2"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="b3"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="b4"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="b5"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="b6"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="b7"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="b8"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+  <link name="b9"><mass>0.08</mass>
+    <box x_half="0.15" y_half="0.25" z_half="0.15" center="0 -0.25 0"/>
+  </link>
+
+  <!-- 链 A：根铰在 (0, 0.5, 0)，轴沿 X → 在 YZ 面内摆动 -->
+  <joint name="a_root" type="hinge">
+    <parent>world</parent>
+    <child>a0</child>
+    <origin>0 0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="a_0" type="hinge">
+    <parent>a0</parent>
+    <child>a1</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="a_1" type="hinge">
+    <parent>a1</parent>
+    <child>a2</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="a_2" type="hinge">
+    <parent>a2</parent>
+    <child>a3</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="a_3" type="hinge">
+    <parent>a3</parent>
+    <child>a4</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="a_4" type="hinge">
+    <parent>a4</parent>
+    <child>a5</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="a_5" type="hinge">
+    <parent>a5</parent>
+    <child>a6</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="a_6" type="hinge">
+    <parent>a6</parent>
+    <child>a7</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="a_7" type="hinge">
+    <parent>a7</parent>
+    <child>a8</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="a_8" type="hinge">
+    <parent>a8</parent>
+    <child>a9</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+
+  <!-- 链 B：根铰 (0, 1.5, 0)，高于链 A，同竖直线以便下落时压在链 A 上 -->
+  <joint name="b_root" type="hinge">
+    <parent>world</parent>
+    <child>b0</child>
+    <origin>0 1.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="b_0" type="hinge">
+    <parent>b0</parent>
+    <child>b1</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="b_1" type="hinge">
+    <parent>b1</parent>
+    <child>b2</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="b_2" type="hinge">
+    <parent>b2</parent>
+    <child>b3</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="b_3" type="hinge">
+    <parent>b3</parent>
+    <child>b4</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="b_4" type="hinge">
+    <parent>b4</parent>
+    <child>b5</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="b_5" type="hinge">
+    <parent>b5</parent>
+    <child>b6</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="b_6" type="hinge">
+    <parent>b6</parent>
+    <child>b7</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="b_7" type="hinge">
+    <parent>b7</parent>
+    <child>b8</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+  <joint name="b_8" type="hinge">
+    <parent>b8</parent>
+    <child>b9</child>
+    <origin>0 -0.5 0</origin>
+    <axis>1 0 0</axis>
+    <limit lower="-3.14159" upper="3.14159"/>
+  </joint>
+
+</robot>
