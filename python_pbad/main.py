@@ -1,4 +1,15 @@
-"""Entry: debug / batch_debug / run_sim / batch_run_sim. Run with no args for usage."""
+"""Entry: debug / batch_debug / run_sim / batch_run_sim. Run with no args for usage.
+
+debug-mode flags:
+  --energy-only   Only ``debug_energy`` (DDE-* directional Hessian checks).
+  --xl            Use ``simulator_adapt`` and add the DTDXL ANA/AD/FD compare.
+  --xl-only       Like --xl but skip the regular three sections.
+  --gtol/--delta/--trials/--head/--seed/--no-autograd : XL tuning.
+
+Top-level aliases:
+  debug_energy  ==  debug --energy-only
+  debug_xl      ==  debug --xl-only
+"""
 
 import math
 import os
@@ -7,6 +18,11 @@ import time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Repo root, so we can import the standalone XL-debug helper module.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from robot import Robot
 from simulator import ConvexHullPBADSimulator
 
@@ -17,6 +33,29 @@ except ImportError:
     HAS_BATCH = False
 
 DTYPE = torch.float64
+
+
+# ---------------------------------------------------------------------------
+#  XL-debug helpers (lazy-imported; only needed when the user passes --xl /
+#  --xl-only / runs the ``debug_xl`` mode, OR --energy-only --xl).
+# ---------------------------------------------------------------------------
+def _import_xl_helpers():
+    """Return ``(AdaptSim, run_dtdxl_compare)`` for vertex-column gradient
+    debugging.  Raises a clear ImportError if either component is missing."""
+    try:
+        from simulator_adapt import (
+            ConvexHullPBADSimulator as AdaptSim)  # noqa: WPS433
+    except ImportError as ex:
+        raise ImportError(
+            "simulator_adapt is required for --xl / debug_xl but was not "
+            "found on PYTHONPATH.") from ex
+    try:
+        from debug_adapt_vertex import run_dtdxl_compare  # noqa: WPS433
+    except ImportError as ex:
+        raise ImportError(
+            "debug_adapt_vertex.py (in repo root) provides "
+            "run_dtdxl_compare; it could not be imported.") from ex
+    return AdaptSim, run_dtdxl_compare
 
 
 def _default_pd_seq(robot, n_steps, device, dtype):
@@ -80,13 +119,88 @@ def _batch_initial_theta_spread_root_y(
 # =====================================================================
 
 def debug(xml_path, device='cpu', *, use_random=False, scale=0.1,
-          warmup_steps=10, render=False):
+          warmup_steps=20, render=False,
+          # selectors
+          energy_only: bool = False,
+          xl: bool = False,
+          xl_only: bool = False,
+          # XL tuning
+          xl_gtol: float = 1e-12,
+          xl_max_iter: int = 2000,
+          xl_delta: float = 1e-5,
+          xl_trials: int = 3,
+          xl_head: int = 8,
+          xl_seed: int = 0,
+          xl_no_autograd: bool = False):
+    """Single-env debug.
+
+    Default
+        Uses :mod:`simulator` and runs ``debug_energy`` (DDE-* directional
+        Hessian checks) + ``debug_backward`` (IFT) + ``debug_verify_theta_derivatives_fd``
+        (θ gradient/Hessian FD).
+
+    --energy-only
+        Only the ``debug_energy`` section (every ``DDE-*`` line: DDE / DDE-L /
+        DDE-LL / DDE-P / DDE-XL with ANA / FD / AD triples).  Picks
+        :mod:`simulator_adapt` automatically when combined with ``--xl``.
+
+    --xl / --xl-only
+        Use :mod:`simulator_adapt` and additionally run
+        :func:`debug_adapt_vertex.run_dtdxl_compare` (the detailed DTDXL
+        ANA / Autograd / FD comparison).  ``--xl-only`` skips the regular
+        three sections.
+
+    Combos
+        ``--energy-only --xl``  ⇒  only DDE-* checks, but using the **adapted**
+        simulator (so DDE-XL goes through the adapted ``_compute_HThetaD`` /
+        ``_jvp_grad_theta_wrt_local_verts_autograd``).
+    """
+    use_adapt = bool(xl or xl_only)
+
+    # --- which sections will run (resolved from selectors) ----------------
+    run_energy = not xl_only
+    run_backward = (not energy_only) and (not xl_only)
+    run_theta_fd = (not energy_only) and (not xl_only)
+    run_xl_compare = use_adapt and (not energy_only)
+
+    title_bits = []
+    if run_energy:
+        title_bits.append("energy")
+    if run_backward:
+        title_bits.append("backward")
+    if run_theta_fd:
+        title_bits.append("θ-FD")
+    if run_xl_compare:
+        title_bits.append("XL")
+    if not title_bits:
+        title_bits = ["(nothing selected)"]
+
     print("=" * 60)
-    print("  ConvexHullPBAD Full Debug (energy + backward + θ-FD)")
+    if energy_only and not use_adapt:
+        print("  ConvexHullPBAD Energy Debug (DDE-* only, simulator)")
+    elif energy_only and use_adapt:
+        print("  ConvexHullPBAD Energy Debug (DDE-* only, simulator_adapt)")
+    elif xl_only:
+        print("  ConvexHullPBAD Debug — XL ONLY (simulator_adapt)")
+    elif use_adapt:
+        print("  ConvexHullPBAD Full Debug (energy + backward + θ-FD + XL, simulator_adapt)")
+    else:
+        print("  ConvexHullPBAD Full Debug (energy + backward + θ-FD)")
+    print(f"  sections: {' + '.join(title_bits)}")
     print("=" * 60)
 
     robot = Robot(xml_path, device=device, dtype=DTYPE)
-    sim = ConvexHullPBADSimulator(robot, dt=0.01, device=device, _output=True)
+    if use_adapt:
+        AdaptSim, run_dtdxl_compare = _import_xl_helpers()
+        # XL-only / energy-only: keep step()'s LM logs quiet.
+        sim_output = not (xl_only or energy_only)
+        sim = AdaptSim(
+            robot, dt=0.01, device=device, _output=sim_output,
+            gtol=xl_gtol, max_newton_iter=xl_max_iter)
+    else:
+        sim_output = not energy_only
+        sim = ConvexHullPBADSimulator(
+            robot, dt=0.01, device=device, _output=sim_output)
 
     theta = theta_t = theta_tm1 = pd_target = None
     manifolds = None
@@ -96,6 +210,9 @@ def debug(xml_path, device='cpu', *, use_random=False, scale=0.1,
         theta_tm1 = theta_t.clone()
         pd_target = theta_t.clone()
         print(f"\n--- warm-up ({warmup_steps} steps) ---")
+        sim_output_save = sim._output
+        if xl_only or energy_only:
+            sim._output = False
         for s in range(warmup_steps):
             theta_tp1, _, manifolds = sim.step(
                 theta_t, theta_tm1, pd_target, 100.0, 10.0)
@@ -103,23 +220,26 @@ def debug(xml_path, device='cpu', *, use_random=False, scale=0.1,
             theta_t = theta_tp1
             print(f"  step {s + 1}: body_y={theta_t[1].item():.4f}  "
                   f"contacts={len(manifolds)}")
+        sim._output = sim_output_save
         theta = theta_t.clone()
 
-    print("\n" + "=" * 60)
-    print("  debug_energy")
-    print("=" * 60)
-    sim.debug_energy(
-        scale=scale, theta=theta, theta_t=theta_t, theta_tm1=theta_tm1,
-        pd_target=pd_target, kp=100.0, kd=10.0, manifolds=manifolds)
+    if run_energy:
+        print("\n" + "=" * 60)
+        print("  debug_energy  (DDE / DDE-L / DDE-LL / DDE-P / DDE-XL)")
+        print("=" * 60)
+        sim.debug_energy(
+            scale=scale, theta=theta, theta_t=theta_t, theta_tm1=theta_tm1,
+            pd_target=pd_target, kp=100.0, kd=10.0, manifolds=manifolds)
 
-    print("\n" + "=" * 60)
-    print("  debug_backward (IFT)")
-    print("=" * 60)
-    sim.debug_backward(
-        scale=scale, theta_t=theta_t, theta_tm1=theta_tm1,
-        pd_target=pd_target, kp=100.0, kd=10.0, manifolds=manifolds)
+    if run_backward:
+        print("\n" + "=" * 60)
+        print("  debug_backward (IFT)")
+        print("=" * 60)
+        sim.debug_backward(
+            scale=scale, theta_t=theta_t, theta_tm1=theta_tm1,
+            pd_target=pd_target, kp=100.0, kd=10.0, manifolds=manifolds)
 
-    if theta is not None:
+    if run_theta_fd and theta is not None:
         print("\n" + "=" * 60)
         print("  debug_verify_theta_derivatives_fd")
         print("=" * 60)
@@ -127,11 +247,34 @@ def debug(xml_path, device='cpu', *, use_random=False, scale=0.1,
             theta, theta_t, theta_tm1, pd_target,
             kp=100.0, kd=10.0, manifolds=manifolds)
 
+    if run_xl_compare:
+        if theta_t is None:
+            print("\n[XL] use_random was set; XL test needs a warm-up state — skipping.")
+        else:
+            print("\n" + "=" * 60)
+            print("  XL gradient (DTDXL) — ANA  vs  AD  vs  FD  (simulator_adapt)")
+            print("=" * 60)
+            print(
+                f"  gtol={xl_gtol}  delta={xl_delta}  trials={xl_trials}  "
+                f"autograd={'on' if not xl_no_autograd else 'off'}")
+            run_dtdxl_compare(
+                sim,
+                theta_t=theta_t, theta_tm1=theta_tm1, pd_target=pd_target,
+                manifolds=manifolds, kp=100.0, kd=10.0,
+                delta=xl_delta, trials=xl_trials, head=xl_head,
+                do_autograd=not xl_no_autograd, seed=xl_seed,
+                banner=False)
+
     if render and theta is not None:
         from visualizer import SpiderVisualizer
         SpiderVisualizer(robot).snapshot(theta, title='Debug state')
 
-    print("\nFull debug complete.")
+    if energy_only:
+        print("\nEnergy debug complete.")
+    elif xl_only:
+        print("\nXL debug complete.")
+    else:
+        print("\nFull debug complete.")
 
 
 # =====================================================================
@@ -314,6 +457,27 @@ def batch_run_sim(xml_path, device='cpu', N=4, n_steps=200, dt=0.01, *,
 #  CLI
 # =====================================================================
 
+def _arg_kv(argv, key, cast=str, default=None):
+    """Parse ``--key VALUE`` or ``--key=VALUE`` from ``argv``.
+
+    Returns ``cast(value)`` if found, else ``default``.  Hand-rolled to keep the
+    long-standing positional CLI (``main.py [mode] …``) compatible.
+    """
+    pref_eq = key + "="
+    for i, a in enumerate(argv):
+        if a == key and i + 1 < len(argv):
+            try:
+                return cast(argv[i + 1])
+            except (TypeError, ValueError):
+                return default
+        if a.startswith(pref_eq):
+            try:
+                return cast(a[len(pref_eq):])
+            except (TypeError, ValueError):
+                return default
+    return default
+
+
 if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}")
@@ -328,8 +492,36 @@ if __name__ == '__main__':
     render = '--render' in sys.argv
     nums = [int(a) for a in sys.argv[2:] if a.isdigit()]
 
+    # XL / energy options shared across `debug`, `debug_energy`, `debug_xl`.
+    _dbg_kw = dict(
+        energy_only='--energy-only' in sys.argv,
+        xl='--xl' in sys.argv,
+        xl_only='--xl-only' in sys.argv,
+        xl_gtol=_arg_kv(sys.argv, '--gtol', float, 1e-12),
+        xl_max_iter=_arg_kv(sys.argv, '--max-iter', int, 2000),
+        xl_delta=_arg_kv(sys.argv, '--delta', float, 1e-5),
+        xl_trials=_arg_kv(sys.argv, '--trials', int, 3),
+        xl_head=_arg_kv(sys.argv, '--head', int, 8),
+        xl_seed=_arg_kv(sys.argv, '--seed', int, 0),
+        xl_no_autograd='--no-autograd' in sys.argv,
+    )
+
     if mode == 'debug':
-        debug(xml_path, device, use_random='random' in sys.argv, render=render)
+        debug(xml_path, device,
+              use_random='random' in sys.argv, render=render,
+              **_dbg_kw)
+    elif mode == 'debug_energy':
+        # Convenience alias: only DDE-* directional Hessian checks.
+        kw = dict(_dbg_kw)
+        kw['energy_only'] = True
+        debug(xml_path, device,
+              use_random='random' in sys.argv, render=render, **kw)
+    elif mode == 'debug_xl':
+        # Convenience alias: only DTDXL ANA / AD / FD compare.
+        kw = dict(_dbg_kw)
+        kw['xl_only'] = True
+        debug(xml_path, device,
+              use_random='random' in sys.argv, render=render, **kw)
     elif mode == 'batch_debug':
         batch_debug(xml_path, device, N=nums[0] if nums else 4,
                     use_random='random' in sys.argv)
@@ -343,8 +535,23 @@ if __name__ == '__main__':
             render=render)
     else:
         print("Usage: python main.py [mode] [options]")
-        print("  debug [random] [--render]")
+        print("  debug [random] [--render] [--energy-only] [--xl|--xl-only] [XL options]")
+        print("        # default: simulator.* — debug_energy + debug_backward + θ-FD")
+        print("        # --energy-only       : only debug_energy (every DDE-* line)")
+        print("        # --xl                : simulator_adapt + extra DTDXL compare")
+        print("        # --xl-only           : simulator_adapt + only DTDXL compare")
+        print("  debug_energy [random] [--xl] [XL options]   (alias: debug --energy-only)")
+        print("        # quick way to verify all DDE-* directional Hessians")
+        print("  debug_xl [random] [XL options]              (alias: debug --xl-only)")
         print("  batch_debug [N] [random]")
         print("  sim [steps] [--render]")
         print("  batch_sim [N] [steps] [--render]")
-        print("                             one multi_step_batch over full horizon (async PD per env)")
+        print("")
+        print("XL options (default values shown):")
+        print("  --gtol 1e-12        # LM gradient tolerance (tight ⇒ FD-IFT meaningful)")
+        print("  --max-iter 2000     # LM iteration cap")
+        print("  --delta 1e-5        # finite-difference step in vertex space")
+        print("  --trials 3          # number of random unit dc directions")
+        print("  --head 8            # leading components printed per vector")
+        print("  --seed 0            # torch.manual_seed for dc directions")
+        print("  --no-autograd       # disable AD reference (only ANA vs FD)")

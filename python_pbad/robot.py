@@ -73,6 +73,36 @@ def box_vertices(x_half: float, y_half: float, z_half: float,
     return signs * torch.tensor([x_half, y_half, z_half], device=device, dtype=dtype)
 
 
+def box_surface_fibonacci_points(
+        x_half: float, y_half: float, z_half: float, n: int,
+        center: torch.Tensor,
+        device='cpu', dtype=torch.float32) -> torch.Tensor:
+    """*n* points on the surface of an axis-aligned box (± half extents).
+
+    Fibonacci directions on the unit sphere, then radial projection onto the
+    box boundary (same idea as distributing samples on a cuboid).
+    """
+    golden = (1.0 + math.sqrt(5.0)) / 2.0
+    xh = max(float(x_half), 1e-20)
+    yh = max(float(y_half), 1e-20)
+    zh = max(float(z_half), 1e-20)
+    pts = []
+    for i in range(n):
+        theta = 2.0 * math.pi * i / golden
+        cos_phi = 1.0 - 2.0 * (i + 0.5) / n
+        sin_phi = math.sqrt(max(0.0, 1.0 - cos_phi * cos_phi))
+        sx = sin_phi * math.cos(theta)
+        sy = cos_phi
+        sz = sin_phi * math.sin(theta)
+        ax = abs(sx) / xh
+        ay = abs(sy) / yh
+        az = abs(sz) / zh
+        t = max(ax, ay, az) + 1e-20
+        pts.append([sx / t, sy / t, sz / t])
+    out = torch.tensor(pts, device=device, dtype=dtype)
+    return out + center.to(device=device, dtype=dtype)
+
+
 def capsule_vertices(radius: float, half_height: float, n_verts: int = 96,
                      center: Tuple[float, ...] = (0., 0., 0.),
                      device='cpu', dtype=torch.float32) -> torch.Tensor:
@@ -152,6 +182,15 @@ class LinkInfo:
     parent_joint_idx: int = -1
     dof_offset: int = 0
     n_dof: int = 0
+    # XML geometry (engine frame) for contact-only resampling — same as main.py
+    # ``Robot(xml)`` hull, fewer surface points via ``sample_link_contact_surface_points``.
+    geom_kind: str = ''            # '', 'capsule_y', 'capsule_fromto', 'box'
+    geom_r: float = 0.0
+    geom_hh: float = 0.0           # capsule along +Y (centered)
+    geom_center: Optional[torch.Tensor] = None   # [3] offset for box / capsule_y
+    geom_p1: Optional[torch.Tensor] = None       # capsule_fromto endpoints
+    geom_p2: Optional[torch.Tensor] = None
+    geom_box_half: Optional[torch.Tensor] = None  # [3] positive half extents
 
 
 @dataclass
@@ -214,6 +253,13 @@ class Robot:
             name = elem.get('name')
             mass = float(elem.find('mass').text)
 
+            gkind = ''
+            gh_r, gh_hh = 0.0, 0.0
+            gcenter: Optional[torch.Tensor] = None
+            gp1: Optional[torch.Tensor] = None
+            gp2: Optional[torch.Tensor] = None
+            gboxh: Optional[torch.Tensor] = None
+
             cap = elem.find('capsule')
             b = elem.find('box')
             if cap is not None:
@@ -230,23 +276,45 @@ class Robot:
                         p1 = torch.tensor(ft[0:3], device=dev, dtype=dt)
                         p2 = torch.tensor(ft[3:6], device=dev, dtype=dt)
                     verts = capsule_vertices_fromto(p1, p2, r, nv, dev, dt)
+                    gkind = 'capsule_fromto'
+                    gh_r = r
+                    gp1, gp2 = p1.clone(), p2.clone()
                 else:
                     hh = float(cap.get('half_height'))
-                    ctr = tuple(float(v) for v in cap.get('center', '0 0 0').split())
-                    verts = capsule_vertices(r, hh, nv, center=ctr, device=dev, dtype=dt)
+                    ctr = [float(v) for v in cap.get('center', '0 0 0').split()]
+                    if self._frame == 'mj_zup':
+                        gcenter = mj_zup_vec_to_engine(ctr[0], ctr[1], ctr[2], dev, dt)
+                        ctr_e = tuple(float(x) for x in gcenter.tolist())
+                    else:
+                        gcenter = torch.tensor(ctr, device=dev, dtype=dt)
+                        ctr_e = tuple(float(x) for x in ctr)
+                    verts = capsule_vertices(r, hh, nv, center=ctr_e, device=dev, dtype=dt)
+                    gkind = 'capsule_y'
+                    gh_r = r
+                    gh_hh = hh
             elif b is not None:
-                verts = box_vertices(
-                    float(b.get('x_half')), float(b.get('y_half')),
-                    float(b.get('z_half')), dev, dt)
+                xh = float(b.get('x_half'))
+                yh = float(b.get('y_half'))
+                zh = float(b.get('z_half'))
+                verts = box_vertices(xh, yh, zh, dev, dt)
                 bctr = b.get('center')
                 if bctr is not None:
-                    bc = [float(v) for v in bctr.split()]
-                    verts = verts + conv_vec3(bc)
+                    off = conv_vec3([float(v) for v in bctr.split()])
+                    verts = verts + off
+                else:
+                    off = torch.zeros(3, device=dev, dtype=dt)
+                gkind = 'box'
+                gboxh = torch.tensor([xh, yh, zh], device=dev, dtype=dt)
+                gcenter = off
             else:
                 raise ValueError(f"Link '{name}' has no geometry (box or capsule)")
 
             link_name_to_idx[name] = len(self.links)
-            self.links.append(LinkInfo(name=name, mass=mass, local_vertices=verts))
+            self.links.append(LinkInfo(
+                name=name, mass=mass, local_vertices=verts,
+                geom_kind=gkind, geom_r=gh_r, geom_hh=gh_hh,
+                geom_center=gcenter, geom_p1=gp1, geom_p2=gp2,
+                geom_box_half=gboxh))
 
         dof_offset = 0
         for elem in root.findall('joint'):
@@ -271,6 +339,8 @@ class Robot:
 
             if jtype == 'free':
                 n_dof = 6
+            elif jtype == 'ball':
+                n_dof = 3
             elif jtype == 'fixed':
                 n_dof = 0
             else:
@@ -329,6 +399,10 @@ class Robot:
                 off = joint.dof_offset
                 R = euler_to_rotation_matrix(theta[off+3], theta[off+4], theta[off+5])
                 T_joint = make_transform(R, theta[off:off+3])
+            elif joint.jtype == 'ball':
+                off = joint.dof_offset
+                R = euler_to_rotation_matrix(theta[off], theta[off+1], theta[off+2])
+                T_joint = make_transform(R, joint.origin)
             elif joint.jtype == 'fixed':
                 T_joint = make_transform(
                     torch.eye(3, device=dev, dtype=dt), joint.origin)
@@ -355,6 +429,11 @@ class Robot:
                 R = euler_to_rotation_matrix_batch(
                     theta[:, off + 3], theta[:, off + 4], theta[:, off + 5])
                 T_jnt = make_transform_batch(R, theta[:, off:off + 3])
+            elif joint.jtype == 'ball':
+                R = euler_to_rotation_matrix_batch(
+                    theta[:, off], theta[:, off + 1], theta[:, off + 2])
+                t = joint.origin.unsqueeze(0).expand(N, -1)
+                T_jnt = make_transform_batch(R, t)
             elif joint.jtype == 'fixed':
                 I3 = torch.eye(3, device=dev, dtype=dt).unsqueeze(0).expand(N, -1, -1)
                 t = joint.origin.unsqueeze(0).expand(N, -1)
@@ -407,4 +486,53 @@ class Robot:
                 lo = max(j.limit_lower + 0.1, -noise_range)
                 hi = min(j.limit_upper - 0.1, noise_range)
                 theta[j.dof_offset] = lo + torch.rand(1, device=self.device, dtype=self.dtype).squeeze() * (hi - lo)
+            elif j.jtype == 'ball':
+                lo = max(j.limit_lower + 0.1, -noise_range)
+                hi = min(j.limit_upper - 0.1, noise_range)
+                for e in range(3):
+                    theta[j.dof_offset + e] = lo + torch.rand(
+                        1, device=self.device, dtype=self.dtype).squeeze() * (hi - lo)
         return theta
+
+
+def sample_link_contact_surface_points(
+        robot: Robot, n_per_link: int = 16,
+        device=None, dtype=None) -> Robot:
+    """Downsample each link to *n_per_link* vertices **on the XML surface**.
+
+    Uses the same capsule/box definitions as ``Robot._parse_xml`` / ``main.py``
+    (Fibonacci-on-surface pills via ``capsule_vertices`` /
+    ``capsule_vertices_fromto``; box via ``box_surface_fibonacci_points``),
+    not a bounding sphere.  Intended for contact / convex-hull proxies only.
+    """
+    dev = robot.device if device is None else device
+    dt = robot.dtype if dtype is None else dtype
+    for link in robot.links:
+        k = link.geom_kind
+        if k == 'capsule_y':
+            c = (link.geom_center if link.geom_center is not None
+                 else torch.zeros(3, device=dev, dtype=dt))
+            ctr = tuple(float(x) for x in c.tolist())
+            v = capsule_vertices(
+                link.geom_r, link.geom_hh, n_per_link, center=ctr,
+                device=dev, dtype=dt)
+        elif k == 'capsule_fromto':
+            p1 = link.geom_p1.to(device=dev, dtype=dt)
+            p2 = link.geom_p2.to(device=dev, dtype=dt)
+            v = capsule_vertices_fromto(
+                p1, p2, link.geom_r, n_per_link, dev, dt)
+        elif k == 'box':
+            h = link.geom_box_half.to(device=dev, dtype=dt)
+            c = (link.geom_center if link.geom_center is not None
+                 else torch.zeros(3, device=dev, dtype=dt))
+            v = box_surface_fibonacci_points(
+                float(h[0].item()), float(h[1].item()), float(h[2].item()),
+                n_per_link, c.to(device=dev, dtype=dt), dev, dt)
+        else:
+            v = link.local_vertices
+            if v.shape[0] > n_per_link:
+                v = v[:n_per_link].clone().to(device=dev, dtype=dt)
+            else:
+                v = v.to(device=dev, dtype=dt)
+        link.local_vertices = v
+    return robot
