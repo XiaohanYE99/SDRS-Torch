@@ -1487,11 +1487,19 @@ class ConvexHullPBADSimulator:
 
     @staticmethod
     def _compute_d2R_single(cr, sr, cp, sp, cy, sy, z):
-        """Single-env d²R: scalar inputs, returns [6, 3, 3] for upper-tri (r,s)."""
+        """Single-env d²R: scalar inputs, returns [6, 3, 3] for upper-tri (r,s).
+
+        Each ``d??`` matrix is ``∂²R/∂eu_r∂eu_s`` with the standard
+        ``[row, col]`` indexing (so ``d??[i, j] = ∂²R[i, j]/∂eu_r∂eu_s``).
+        The s3(...) literals below give rows of that matrix, so ``m3`` must
+        stack them along ``dim=0`` (i.e. as rows).  Using ``dim=1`` would
+        transpose the result, breaking Euler-Euler FK correction in the
+        ``(d2R * Q).sum()`` Frobenius pairing (Q is generally non-symmetric).
+        """
         def s3(a, b, c):
             return torch.stack([a, b, c])
-        def m3(r0, r1, r2):
-            return torch.stack([r0, r1, r2], dim=1)
+        def m3(row0, row1, row2):
+            return torch.stack([row0, row1, row2], dim=0)
         d00 = m3(s3(z, -cy*sp*sr+sy*cr, -cy*sp*cr-sy*sr),
                  s3(z, -sy*sp*sr-cy*cr, -sy*sp*cr+cy*sr),
                  s3(z, -cp*sr, -cp*cr))
@@ -2435,17 +2443,19 @@ class ConvexHullPBADSimulator:
 
         va_h_fn = torch.cat([va_curr_k, ones_K1], 2)
         d_fn = -torch.einsum('kmi,ki->km', va_h_fn, pn_stack)
-        _, bg_fn, _ = barrier_eval(d_fn, self.x0, self._barrier_d0_half)
+        _, bg_fn, bh_fn = barrier_eval(d_fn, self.x0, self._barrier_d0_half)
         pn3_fc = pn_stack[:, :3]
         f_vec_fc = coef * bg_fn.unsqueeze(2) * pn3_fc.unsqueeze(1)
         fn_sq_fc = f_vec_fc.pow(2).sum(dim=2)
-        A_m_fc = torch.sqrt(fn_sq_fc + _eps_s) - self._sqrt_friction_eps_s
+        A_m_sqrt = torch.sqrt(fn_sq_fc + _eps_s)
+        A_m_fc = A_m_sqrt - self._sqrt_friction_eps_s
 
         s_norm = torch.sqrt(rel_vel.pow(2).sum(2) + _eps_s)
         inv_s = 1.0 / (s_norm + 1e-30)
         inv_s3 = inv_s.pow(3)
 
         weight_fric = self.friction / dt * A_m_fc * vmask_a
+        # PMP = Proj/s - q q^T/s^3 = Proj · PMP_inner · Proj  (q tangent ⇒ Proj·q=q)
         PMP = (Proj.unsqueeze(1) * inv_s.unsqueeze(2).unsqueeze(3)
                - rel_vel.unsqueeze(-1) * rel_vel.unsqueeze(-2)
                  * inv_s3.unsqueeze(2).unsqueeze(3))
@@ -2464,6 +2474,7 @@ class ConvexHullPBADSimulator:
 
         J_star_a = J_star[lid]
         J_t_a = J_t[lid]
+        # TERM I (vel chain via Proj/dt): existing
         Hx_fric = -_jthj_sum(J_star_a, H_fric, J_t_a)
 
         if lnk_idx.numel() > 0:
@@ -2475,6 +2486,61 @@ class ConvexHullPBADSimulator:
             Hx_fric -= _jthj_sum(J_star_b, Hf_ll, J_t_b)
             Hx_fric += _jthj_sum(Js_a_ll, Hf_ll, J_t_b)
             Hx_fric += _jthj_sum(J_star_b, Hf_ll, Jt_a_ll)
+
+        # ============================================================
+        # TERM II: ω · skew(n̂) chain through r_nx = n̂ × va_curr (A side only)
+        # ∂²s/(∂v_next ∂v_a_curr)[ω part] = (1/dt) · PMP_inner · (-ω · skew(n̂))
+        # where PMP_inner = I/s - q q^T / s^3   (NOT PMP_code; left side is I not Proj).
+        # Total piece into H_θθ_t:
+        #   -μ·ω·A_m·v_a · J_star_a^T · PMP_inner · skew(n̂) · J_t_a   (gnd+lnk A-side θ)
+        #   +μ·ω·A_m·v_a · J_star_b^T · PMP_inner · skew(n̂) · J_t_a   (lnk B-side θ only)
+        # ============================================================
+        eye3 = self._eye3
+        # PMP_inner [K, M, 3, 3] = δ/s − q q^T / s^3
+        PMP_inner = (eye3.unsqueeze(0).unsqueeze(0)
+                     * inv_s.unsqueeze(2).unsqueeze(3)
+                     - rel_vel.unsqueeze(-1) * rel_vel.unsqueeze(-2)
+                       * inv_s3.unsqueeze(2).unsqueeze(3))
+        # skew(n̂) [K, 3, 3]
+        zerosK = torch.zeros(K, device=dev, dtype=dty)
+        nx, ny, nz = n_hat[:, 0], n_hat[:, 1], n_hat[:, 2]
+        SK_n = torch.stack([
+            torch.stack([zerosK, -nz, ny], dim=-1),
+            torch.stack([nz, zerosK, -nx], dim=-1),
+            torch.stack([-ny, nx, zerosK], dim=-1),
+        ], dim=-2)
+        # PMP_inner · skew(n̂) [K, M, 3, 3]
+        PMP_SK = torch.einsum('kmab,kbc->kmac', PMP_inner, SK_n)
+        # weight_ω[k,m] = -μ · ω[k] · A_m[k,m] · v_a[k,m]
+        w_om = (-self.friction * omega_stack_fc.view(K, 1)
+                * A_m_fc * vmask_a)
+        H_om = w_om.unsqueeze(2).unsqueeze(3) * PMP_SK
+        Hx_fric = Hx_fric + _jthj_sum(J_star_a, H_om, J_t_a)
+        if lnk_idx.numel() > 0:
+            H_om_ll = H_om[lnk_idx]
+            Hx_fric = Hx_fric - _jthj_sum(
+                J_star[lid_b_lnk], H_om_ll, J_t_a[lnk_idx])
+
+        # ============================================================
+        # TERM III: A_m chain via va_curr → d_fn → bg_fn → A_m  (A side only)
+        # ∂A_m/∂v_a_curr = α_A · pn3,  α_A = -coef²·b_g·b_h·‖pn3‖² / √(fn²+ε)
+        # ∂²E/∂θ_i ∂θ_t,j (A_m part) = μ · v_a · α_A · (pn3·J_t_a)_j · (q·J_star)_i / s
+        # ============================================================
+        pn3_norm_sq = (pn3_fc * pn3_fc).sum(-1)             # [K]
+        alpha_A = (-(coef * coef) * bg_fn * bh_fn
+                   * pn3_norm_sq.unsqueeze(1)) / A_m_sqrt   # [K, M]
+        alpha_factor = self.friction * alpha_A * vmask_a * inv_s  # [K, M]
+        pn3_Jt_a = torch.einsum('kc,kmci->kmi', pn3_fc, J_t_a)    # [K, M, n]
+        q_Jsa = torch.einsum('kmc,kmci->kmi', rel_vel, J_star_a)  # [K, M, n]
+        Hx_fric = Hx_fric + torch.einsum(
+            'km,kmi,kmj->ij', alpha_factor, q_Jsa, pn3_Jt_a)
+        if lnk_idx.numel() > 0:
+            J_star_b_ll = J_star[lid_b_lnk]
+            q_Jsb = torch.einsum(
+                'kmc,kmci->kmi', rel_vel[lnk_idx], J_star_b_ll)
+            Hx_fric = Hx_fric - torch.einsum(
+                'km,kmi,kmj->ij',
+                alpha_factor[lnk_idx], q_Jsb, pn3_Jt_a[lnk_idx])
         return Hx_fric
 
     # dg_u/dθ_t — friction velocity sensitivity for Schur correction
@@ -2630,7 +2696,7 @@ class ConvexHullPBADSimulator:
             theta_star, theta_t, theta_tm1,
             wv_star, wv_t, wv_tm1,
             J_star, pd_target, kp, kd, manifolds,
-            u_tangents=u_tangents)
+            u_tangents=u_tangents, p_normals=pn_fric)
         dg_dd = dg_dd.reshape(n, L * mM * 3)
 
         if self._implicit:
@@ -2754,7 +2820,18 @@ class ConvexHullPBADSimulator:
     def _compute_HThetaD(self, theta_star, theta_t, theta_tm1,
                          wv_star, wv_t, wv_tm1,
                          J_star, pd_target, kp, kd, manifolds,
-                         u_tangents=None):
+                         u_tangents=None, p_normals=None):
+        """∂(∇_θ E)/∂d cross-Hessian (vertex columns).
+
+        ``p_normals``: friction plane normals (4-vec each), one per manifold,
+        for Section C only.  Following C++ ``ConvHullPBDSimulator`` semantics,
+        friction uses the planes snapped at the start of the step
+        (``manifoldsLast``), **not** the LM-converged ``m.p`` (which has
+        already drifted from the snap by the time IFT backward is called).
+        When ``None``, falls back to ``[m.p for m in manifolds]`` (legacy /
+        single-step contexts where ``m.p`` happens to equal the snap).
+        Section B (contact barrier) still uses dynamic ``m.p`` as in C++.
+        """
         dev, dty = self.device, self.dtype
         n = self.n_dof
         L, mM = self._L, self._max_M
@@ -2825,7 +2902,12 @@ class ConvexHullPBADSimulator:
 
         # ==================  C) Friction velocity direct  ==================
         if K > 0 and self._use_friction:
-            pn_stack_f = torch.stack([m.p.detach().clone() for m in manifolds])
+            if p_normals is not None:
+                pn_stack_f = torch.stack(
+                    [t.detach().clone() for t in p_normals])
+            else:
+                pn_stack_f = torch.stack(
+                    [m.p.detach().clone() for m in manifolds])
             u_stack_f = (torch.stack(u_tangents) if u_tangents is not None
                          else torch.stack([m.u.detach() for m in manifolds]))
             lid_a_f = torch.tensor([m.link_a for m in manifolds],
@@ -2864,11 +2946,13 @@ class ConvexHullPBADSimulator:
 
             va_h_fn_f = torch.cat([va_curr_f, ones_K1_f], 2)
             d_fn_f = -torch.einsum('kmi,ki->km', va_h_fn_f, pn_stack_f)
-            _, bg_fn_f, _ = barrier_eval(d_fn_f, x0, self._barrier_d0_half)
+            _, bg_fn_f, bh_fn_f = barrier_eval(
+                d_fn_f, x0, self._barrier_d0_half)
             pn3_f = pn_stack_f[:, :3]
             f_vec_f = coef * bg_fn_f.unsqueeze(2) * pn3_f.unsqueeze(1)
             fn_sq_f = f_vec_f.pow(2).sum(dim=2)
-            A_m_f = torch.sqrt(fn_sq_f + _eps_s) - self._sqrt_friction_eps_s
+            A_m_sqrt_f = torch.sqrt(fn_sq_f + _eps_s)
+            A_m_f = A_m_sqrt_f - self._sqrt_friction_eps_s
 
             s_norm_f = torch.sqrt(rel_vel_f.pow(2).sum(2) + _eps_s)
             inv_s_f = 1.0 / (s_norm_f + 1e-30)
@@ -2883,6 +2967,7 @@ class ConvexHullPBADSimulator:
             dR_vel_A = R_star[lid_a_f] - R_t[lid_a_f]
 
             J_star_a_f = J_star[lid_a_f]
+            # ---------- TERM I: velocity chain through (va_next - va_curr)/dt ----
             contrib_fAA = torch.einsum(
                 'kmci,kmcd,kdj->ikmj', J_star_a_f, H_fric_f, dR_vel_A)
             HThetaD.index_add_(1, lid_a_f, contrib_fAA)
@@ -2906,11 +2991,80 @@ class ConvexHullPBADSimulator:
                     'kmci,kmcd,kdj->ikmj', Js_b, Hf_ll, dR_vel_B)
                 HThetaD.index_add_(1, lid_b_lnk_f, contrib_fBB)
 
+            # ---------- TERM II: ω · skew(n̂) chain via r_nx = n̂ × va_curr ------
+            # ∂r_nx/∂d_local (A-side) = skew(n̂) · R_t_a
+            # ∂²s/(∂v_next ∂d_a_local) ω part = (1/dt) · PMP_inner · (-ω·skew(n̂)·R_t_a)
+            # Total: -μ·ω·A_m·v_a · J_star^T · PMP_inner · skew(n̂) · R_t_a
+            #   (A-side θ → A-side d, B-side θ → A-side d with opposite sign)
+            eye3 = self._eye3
+            PMP_inner_f = (eye3.unsqueeze(0).unsqueeze(0)
+                           * inv_s_f.unsqueeze(2).unsqueeze(3)
+                           - rel_vel_f.unsqueeze(-1)
+                             * rel_vel_f.unsqueeze(-2)
+                             * inv_s3_f.unsqueeze(2).unsqueeze(3))
+            zK = torch.zeros(K, device=dev, dtype=dty)
+            nx_f, ny_f, nz_f = n_hat_f[:, 0], n_hat_f[:, 1], n_hat_f[:, 2]
+            SK_n_f = torch.stack([
+                torch.stack([zK, -nz_f, ny_f], dim=-1),
+                torch.stack([nz_f, zK, -nx_f], dim=-1),
+                torch.stack([-ny_f, nx_f, zK], dim=-1),
+            ], dim=-2)
+            R_t_a = R_t[lid_a_f]                                # [K, 3, 3]
+            # PMP_inner · skew(n̂) · R_t_a → [K, M, 3, 3]
+            PSR_a = torch.einsum(
+                'kmab,kbc,kcd->kmad', PMP_inner_f, SK_n_f, R_t_a)
+            w_om_f = (-self.friction
+                      * omega_stack_f.view(K, 1)
+                      * A_m_f * vmask_a_f)                      # [K, M]
+            HSR_a = w_om_f.unsqueeze(2).unsqueeze(3) * PSR_a    # [K, M, 3, 3]
+            contrib_omAA = torch.einsum(
+                'kmci,kmcj->ikmj', J_star_a_f, HSR_a)
+            HThetaD.index_add_(1, lid_a_f, contrib_omAA)
+
+            if lnk_idx_f.numel() > 0:
+                HSR_a_ll = HSR_a[lnk_idx_f]
+                Js_b_ll = J_star[lid_b_lnk_f]
+                contrib_omBA = -torch.einsum(
+                    'kmci,kmcj->ikmj', Js_b_ll, HSR_a_ll)
+                HThetaD.index_add_(1, lid_a_f[lnk_idx_f], contrib_omBA)
+
+            # ---------- TERM III: A_m chain via va_curr → d_fn → A_m -----------
+            # ∂A_m/∂v_a_curr = α_A · pn3 where
+            #   α_A = -coef² · b_g · b_h · ‖pn3‖² / √(fn²+ε)
+            # ∂A_m/∂d_a_local_j = α_A · (pn3 · R_t_a)_j
+            # ∂²E/∂θ_i ∂d_j (A_m part)
+            #   = μ · v_a · α_A · (pn3·R_t_a)_j · (q·J_star)_i / s
+            #   (B-side θ via vb_next ⇒ opposite sign, A-side d only)
+            pn3_norm_sq_f = (pn3_f * pn3_f).sum(-1)              # [K]
+            alpha_A_f = (-(coef * coef) * bg_fn_f * bh_fn_f
+                         * pn3_norm_sq_f.unsqueeze(1)
+                         ) / A_m_sqrt_f                          # [K, M]
+            alpha_fac_f = (self.friction * alpha_A_f
+                           * vmask_a_f * inv_s_f)                # [K, M]
+            pn3_Rt_a = torch.einsum(
+                'kc,kcd->kd', pn3_f, R_t_a)                      # [K, 3]
+            q_Jsa_f = torch.einsum(
+                'kmc,kmci->kmi', rel_vel_f, J_star_a_f)          # [K, M, n]
+            contrib_III_AA = torch.einsum(
+                'km,kmi,kj->ikmj', alpha_fac_f, q_Jsa_f, pn3_Rt_a)
+            HThetaD.index_add_(1, lid_a_f, contrib_III_AA)
+
+            if lnk_idx_f.numel() > 0:
+                Js_b_ll = J_star[lid_b_lnk_f]
+                q_Jsb_f = torch.einsum(
+                    'kmc,kmci->kmi',
+                    rel_vel_f[lnk_idx_f], Js_b_ll)
+                contrib_III_BA = -torch.einsum(
+                    'km,kmi,kj->ikmj',
+                    alpha_fac_f[lnk_idx_f], q_Jsb_f,
+                    pn3_Rt_a[lnk_idx_f])
+                HThetaD.index_add_(1, lid_a_f[lnk_idx_f], contrib_III_BA)
+
         # ==================  D) FK correction: (∂J/∂d)^T @ g_v  ==================
         g_v = self._compute_gv_at_solution(
             wv_star, wv_t, wv_tm1, manifolds, kp, kd,
             theta_star, pd_target, theta_t,
-            u_tangents=u_tangents)
+            u_tangents=u_tangents, p_normals=p_normals)
         fk_corr = self._compute_fk_correction_d(J_star, g_v, theta_star, wv_star)
         HThetaD = HThetaD + fk_corr
 
@@ -2920,7 +3074,15 @@ class ConvexHullPBADSimulator:
     def _compute_gv_at_solution(self, wv_star, wv_t, wv_tm1,
                                 manifolds, kp, kd,
                                 theta_star, pd_target, theta_t,
-                                u_tangents=None):
+                                u_tangents=None, p_normals=None):
+        """Vertex-level energy gradient at the converged θ*.
+
+        ``p_normals`` (optional): friction plane normals (one 4-vec per
+        manifold) snapped at step start, used only by the friction block to
+        match C++ ``manifoldsLast`` semantics.  When ``None``, falls back to
+        ``[m.p for m in manifolds]``.  Contact barriers always use dynamic
+        ``m.p``.
+        """
         dev, dty = self.device, self.dtype
         L, mM = self._L, self._max_M
         dt = self.dt
@@ -2938,7 +3100,10 @@ class ConvexHullPBADSimulator:
             return g_v
 
         p_stack = torch.stack([m.p.detach() for m in manifolds])
-        pn_stack = torch.stack([m.p.detach().clone() for m in manifolds])
+        if p_normals is not None:
+            pn_stack = torch.stack([t.detach().clone() for t in p_normals])
+        else:
+            pn_stack = torch.stack([m.p.detach().clone() for m in manifolds])
         u_stack = (torch.stack(u_tangents) if u_tangents is not None
                    else torch.stack([m.u.detach() for m in manifolds]))
         lid_a = torch.tensor([m.link_a for m in manifolds],
@@ -3417,7 +3582,7 @@ class ConvexHullPBADSimulator:
             theta, theta_t, theta_tm1,
             wv_star, wv_curr, wv_last,
             J_star, pd_target, kp, kd, mf0,
-            u_tangents=un0)
+            u_tangents=un0, p_normals=pn_fric0)
         HDdc = H_D.reshape(n, -1) @ dc
         fd_dg_X = (g_Xp - g_Xm) / (2.0 * delta)
         self._debug_gradient_cpp(
@@ -3453,6 +3618,8 @@ class ConvexHullPBADSimulator:
             self,
             scale: float = 0.1,
             custom_delta: Optional[float] = None,
+            custom_delta_ift: Optional[float] = None,
+            ift_fd_gtol: Optional[float] = None,
             theta_t: Optional[torch.Tensor] = None,
             theta_tm1: Optional[torch.Tensor] = None,
             pd_target: Optional[torch.Tensor] = None,
@@ -3462,11 +3629,41 @@ class ConvexHullPBADSimulator:
             manifolds: Optional[List[ContactManifold]] = None,
             compare_autograd_backward: bool = True,
             normalize_dx: bool = True) -> None:
-        """IFT backward blocks vs FD, mirroring C++ debugBackward."""
+        """IFT backward blocks vs FD, mirroring C++ debugBackward.
+
+        FD step sizes
+        -------------
+        Two different FD step sizes are used because RHS-FD and IFT-FD have
+        completely different noise floors:
+
+        ``delta`` (=``custom_delta`` or ``DEBUG_FD_EPS=1e-8``):
+            For **RHS-level FD** (``∂(∇_θE)/∂param``), which differentiates
+            the *analytic* gradient evaluator without any iterative solver.
+            Noise floor ≈ ``ε_mach/δ`` ≈ 1e-8.  Small δ is correct here.
+
+        ``delta_ift`` (=``custom_delta_ift`` or 1e-4):
+            For **IFT-level FD** (``dθ\*/dparam``), which requires a full
+            inner LM re-solve at the perturbed parameter and divides by δ.
+            Noise floor ≈ ``LM_gtol / σ_min(H) / δ``.  With the default
+            ``self.gtol=1e-4`` and δ=1e-8, FD-IFT noise dominates the signal
+            (errors of magnitude ≈10 — exactly what is observed when using
+            the single 1e-8 step for both kinds).  A larger ``δ_ift`` plus a
+            temporarily tightened ``ift_fd_gtol`` makes IFT-FD usable.
+
+        ``ift_fd_gtol`` (default min(self.gtol, 1e-10)):
+            LM gradient tolerance to use *only* while solving FD probes.
+            Tighter than the default LM solve so the inner-solver residual
+            does not contaminate the FD numerator.
+        """
         dev, dty = self.device, self.dtype
         n = self.n_dof
         L, mM = self._L, self._max_M
         delta = float(custom_delta) if custom_delta is not None else DEBUG_FD_EPS
+        delta_ift = (float(custom_delta_ift)
+                     if custom_delta_ift is not None else 1e-4)
+        gtol_ift = (float(ift_fd_gtol)
+                    if ift_fd_gtol is not None
+                    else min(self.gtol, 1e-10))
 
         # --- acquire (theta_t, theta_tm1, pd_target) ---
         if theta_t is None and theta_tm1 is None and pd_target is None:
@@ -3531,40 +3728,57 @@ class ConvexHullPBADSimulator:
                 dx = dx / nrm
 
         def fd_solve(tt, tm1, pd_, *, theta_init):
+            """Inner LM re-solve for an FD probe.
+
+            Temporarily tighten ``self.gtol`` so the inner-solver residual is
+            negligible compared with ``δ_ift`` (otherwise the FD numerator is
+            dominated by LM convergence noise and ``(θ*_p - θ*_ref)/δ`` has
+            error ≈ ``gtol_default/δ`` ≈ 1e-4/1e-8 = 1e4 in the worst case).
+            """
             self._output = False
             sa = self._alpha
+            saved_gtol = self.gtol
             self._alpha = 1.0
-            self._local_verts = base_d.clone()
-            self._restore_pair_manifolds(snap_conv)
-            th, _, _ = self.step(
-                tt, tm1, pd_, kp, kd,
-                theta_init=theta_init)
-            self._alpha = sa
-            self._output = saved_out
+            self.gtol = gtol_ift
+            try:
+                self._local_verts = base_d.clone()
+                self._restore_pair_manifolds(snap_conv)
+                th, _, _ = self.step(
+                    tt, tm1, pd_, kp, kd,
+                    theta_init=theta_init)
+            finally:
+                self.gtol = saved_gtol
+                self._alpha = sa
+                self._output = saved_out
             return th
 
         def check_block(tag: str, J: torch.Tensor, direction: torch.Tensor,
                         theta_pert: torch.Tensor):
+            """IFT-FD legacy single-line check (uses ``delta_ift``)."""
             ana = J @ direction
-            fdv = (theta_pert - theta_star) / delta
+            fdv = (theta_pert - theta_star) / delta_ift
             a_n = ana.norm().item()
             e_n = (ana - fdv).norm().item()
-            self._debug_gradient_cpp(tag, a_n, e_n, delta)
+            self._debug_gradient_cpp(tag, a_n, e_n, delta_ift)
 
         # DTDL  —  d theta* / d theta_t  (C++ _HThetaL)
         # Warm-start from converged θ* (same as DTDLL/DTDP). Init = θ_t+δdx alone
         # is a poor FD probe for the IFT linearization and blows up FD vs analytic.
-        tt_p = theta_t + dx * delta
+        # Use ``delta_ift`` (≥1e-4) instead of the RHS-FD ``delta``; otherwise
+        # the LM convergence noise floor (~gtol/σ_min(H)) divided by 1e-8 swamps
+        # the signal and gives spurious O(1) errors regardless of which gradient
+        # block is correct.
+        tt_p = theta_t + dx * delta_ift
         th_p_dt = fd_solve(tt_p, theta_tm1, pd_target, theta_init=theta_star)
         check_block("DTDL", gi.dtheta_dtheta_t, dx, th_p_dt)
 
         # DTDLL — d theta* / d theta_{t-1}  (C++ _HThetaLL)
-        tm1_p = theta_tm1 + dx * delta
+        tm1_p = theta_tm1 + dx * delta_ift
         th_p_dtm1 = fd_solve(theta_t, tm1_p, pd_target, theta_init=theta_star)
         check_block("DTDLL", gi.dtheta_dtheta_tm1, dx, th_p_dtm1)
 
         # DTDP — d theta* / d pd target P  (C++ _HThetaPTarget)
-        pd_p = pd_target + dx * delta
+        pd_p = pd_target + dx * delta_ift
         th_p_dpd = fd_solve(theta_t, theta_tm1, pd_p, theta_init=theta_star)
         check_block("DTDP", gi.dtheta_dpd, dx, th_p_dpd)
 
@@ -3651,21 +3865,27 @@ class ConvexHullPBADSimulator:
             else:
                 dc = dc / _dcn
             d_flat = base_d.reshape(-1)
-            d_pert = (d_flat + dc * delta).reshape(L, mM, 3)
+            d_pert = (d_flat + dc * delta_ift).reshape(L, mM, 3)
             self._output = False
             sa = self._alpha
+            saved_gtol = self.gtol
             self._alpha = 1.0
-            self._local_verts = d_pert.clone()
-            self._restore_pair_manifolds(snap_conv)
-            th_p_ddxl, _, _ = self.step(
-                theta_t, theta_tm1, pd_target, kp, kd,
-                theta_init=theta_star)
-            self._alpha = sa
-            self._output = saved_out
+            self.gtol = gtol_ift
+            try:
+                self._local_verts = d_pert.clone()
+                self._restore_pair_manifolds(snap_conv)
+                th_p_ddxl, _, _ = self.step(
+                    theta_t, theta_tm1, pd_target, kp, kd,
+                    theta_init=theta_star)
+            finally:
+                self.gtol = saved_gtol
+                self._alpha = sa
+                self._output = saved_out
             ana = gi.dtheta_dd @ dc
-            fdv = (th_p_ddxl - theta_star) / delta
+            fdv = (th_p_ddxl - theta_star) / delta_ift
             self._debug_gradient_cpp(
-                "DTDXL", ana.norm().item(), (ana - fdv).norm().item(), delta)
+                "DTDXL", ana.norm().item(),
+                (ana - fdv).norm().item(), delta_ift)
         else:
             print("DTDXL: skipped (dtheta_dd is None).")
             dc = None  # unused
@@ -3774,9 +3994,9 @@ class ConvexHullPBADSimulator:
                 def _solve_r(Rv: torch.Tensor) -> torch.Tensor:
                     return -torch.linalg.solve(H_full, Rv)
 
-                fd_ift_dt = ((th_p_dt - theta_star) / delta).detach()
-                fd_ift_dtm1 = ((th_p_dtm1 - theta_star) / delta).detach()
-                fd_ift_dpd = ((th_p_dpd - theta_star) / delta).detach()
+                fd_ift_dt = ((th_p_dt - theta_star) / delta_ift).detach()
+                fd_ift_dtm1 = ((th_p_dtm1 - theta_star) / delta_ift).detach()
+                fd_ift_dpd = ((th_p_dpd - theta_star) / delta_ift).detach()
 
                 print(
                     "--- backward autograd (same print style as debug_energy) ---")
@@ -3875,7 +4095,7 @@ class ConvexHullPBADSimulator:
                         theta_star, theta_t, theta_tm1,
                         wv_s_ift, wv_cu, wv_la,
                         J_s_ift, pd_target, kp, kd, mf_h,
-                        u_tangents=un_h).reshape(n, -1)
+                        u_tangents=un_h, p_normals=pn_fric_h).reshape(n, -1)
                     b_dd = (dg_dd_h @ dc).detach()
                     b_ag_x = self._jvp_grad_theta_wrt_local_verts_autograd(
                         theta_star, theta_t, theta_tm1, pd_target, kp, kd,
@@ -3921,12 +4141,21 @@ class ConvexHullPBADSimulator:
                         "DTDXL-RHS triple (∂(∇E)/∂d·dc)",
                         b_dd, fd_rhs_x, b_ag_x)
 
+                    # Augmented RHS must match :meth:`_backward_normal`:
+                    #   R = [b_ag_x ; HpD·dc ; HuD·dc]
+                    # ``gi.dtheta_dd`` itself was solved with HpD/HuD in the
+                    # (p, u) rows.  Zero-padding them in this AD reference path
+                    # produces a spurious ANA-vs-AD gap = H_full^{-1}·[0; HpD·dc;
+                    # HuD·dc] that has nothing to do with whether
+                    # ``_jvp_grad_theta_wrt_local_verts_autograd`` is correct.
+                    # Mixing AD on θ-row with ANA on (p, u)-rows isolates the
+                    # θ-row check (RHS triple above already validates it).
                     R_x = torch.zeros(dim_h, device=dev, dtype=dty)
                     R_x[:n] = b_ag_x
                     ag_x = _solve_r(R_x)[:n]
                     cmp_x = (gi.dtheta_dd @ dc).detach()
                     assert th_p_ddxl is not None
-                    fd_ift_x = ((th_p_ddxl - theta_star) / delta).detach()
+                    fd_ift_x = ((th_p_ddxl - theta_star) / delta_ift).detach()
                     self._debug_gradient_cpp(
                         "DTDXL-IFT-AD-ANA", ag_x.norm().item(),
                         (cmp_x - ag_x).norm().item(), delta)
@@ -4266,7 +4495,8 @@ class ConvexHullPBADSimulator:
                     th, th_t, th_tm1,
                     wv_star_c, wv_cu_b, wv_la_b,
                     J_star_c, pd, kp, kd, fixed,
-                    u_tangents=u_tangents).reshape(n, -1)
+                    u_tangents=u_tangents,
+                    p_normals=pn_fric).reshape(n, -1)
                 HDdc = H_D @ dc
                 saved = self._local_verts.clone()
                 self._local_verts = (
