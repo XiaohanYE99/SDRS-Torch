@@ -7,7 +7,7 @@ from typing import List, Tuple, Optional, Dict
 from robot import Robot
 
 # Unified finite-difference step for all debug_* routines (DE/DDE, IFT, θ g/H).
-DEBUG_FD_EPS = 1e-8
+DEBUG_FD_EPS = 1e-6
 
 
 def _autograd_functional_jvp(*args, **kwargs):
@@ -121,7 +121,7 @@ class ConvexHullPBADSimulator:
                  coef_barrier: float = 1e-2,
                  lm_gamma: float = 1e0,
                  friction: float = 0.8, gravity: float = -9.81,
-                 max_newton_iter: int = 1000, gtol: float = 1e-4,
+                 max_newton_iter: int = 1000, gtol: float = 1e-6,
                  device='cuda', _output: bool = True,
                  reject_step_energy_above: Optional[float] = 1e5,
                  use_joint_limit_barrier: bool = False,
@@ -2596,11 +2596,12 @@ class ConvexHullPBADSimulator:
 
         va_h_fn = torch.cat([va_curr_k, ones_K1], 2)
         d_fn = -torch.einsum('kmi,ki->km', va_h_fn, pn_stack)
-        _, bg_fn, _ = barrier_eval(d_fn, self.x0, self._barrier_d0_half)
+        _, bg_fn, bh_fn = barrier_eval(d_fn, self.x0, self._barrier_d0_half)
         pn3_dgu = pn_stack[:, :3]
         f_vec_dgu = coef * bg_fn.unsqueeze(2) * pn3_dgu.unsqueeze(1)
         fn_sq_dgu = f_vec_dgu.pow(2).sum(dim=2)
-        A_m_dgu = torch.sqrt(fn_sq_dgu + _eps_s) - self._sqrt_friction_eps_s
+        A_m_sqrt_dgu = torch.sqrt(fn_sq_dgu + _eps_s)
+        A_m_dgu = A_m_sqrt_dgu - self._sqrt_friction_eps_s
 
         s_norm = torch.sqrt(rel_vel.pow(2).sum(2) + _eps_s)
         inv_s = 1.0 / (s_norm + 1e-30)
@@ -2618,6 +2619,50 @@ class ConvexHullPBADSimulator:
         c_vel = self.friction * A_m_dgu * vmask_a
         c_fm = self.friction * dt * A_m_dgu * vmask_a
         dgu_3 = torch.einsum('km,kmcd,kmdj->kcj', c_vel, MP, J_t_eff)
+
+        # ============================================================
+        # TERM II (xyz): ω · skew(n̂) chain through r_nx = n̂ × va_curr.
+        # ∂rel_vel/∂va_curr has two pieces: (-Proj/dt) [TERM I, captured by
+        # ``MP·J_t_eff``] and (-ω·skew(n̂)) [TERM II, A-side only].  The
+        # second piece propagates into ``rel_vel/s`` via PMP_inner = I/s -
+        # q·qᵀ/s³ (NOT MP), giving an extra contribution to g_u_xyz that
+        # exactly mirrors TERM II in ``_friction_cross_theta_t``.  Without
+        # this term, DTDL-IFT disagrees with FD whenever ω ≠ 0.
+        # ============================================================
+        eye3 = self._eye3
+        PMP_inner = (eye3.unsqueeze(0).unsqueeze(0)
+                     * inv_s.unsqueeze(2).unsqueeze(3)
+                     - rel_vel.unsqueeze(-1) * rel_vel.unsqueeze(-2)
+                       * inv_s3.unsqueeze(2).unsqueeze(3))
+        zerosK = torch.zeros(K, device=dev, dtype=dty)
+        nx, ny, nz = n_hat[:, 0], n_hat[:, 1], n_hat[:, 2]
+        SK_n = torch.stack([
+            torch.stack([zerosK, -nz, ny], dim=-1),
+            torch.stack([nz, zerosK, -nx], dim=-1),
+            torch.stack([-ny, nx, zerosK], dim=-1),
+        ], dim=-2)
+        PMP_SK = torch.einsum('kmab,kbc->kmac', PMP_inner, SK_n)
+        c_om_xyz = (self.friction * dt
+                    * omega_stack_dgu.view(K, 1) * A_m_dgu * vmask_a)
+        dgu_3 = dgu_3 + torch.einsum(
+            'km,kmcd,kmdj->kcj', c_om_xyz, PMP_SK, J_t_a)
+
+        # ============================================================
+        # TERM III: A_m chain via va_curr → d_fn → bg_fn → A_m.  Mirrors
+        # the ``alpha_factor·q_Jsa·pn3_Jt_a`` block in
+        # ``_friction_cross_theta_t`` (A-side only).  Adds an analogous
+        # rank-1 (rel_vel/s)·(pn3·J_t_a) contribution to g_u_xyz and a
+        # (h/s)·(pn3·J_t_a) contribution to g_u_om.  Without these, the
+        # u-row of the IFT RHS is incomplete and DTDL-IFT vs FD diverges.
+        # ============================================================
+        pn3_norm_sq = (pn3_dgu * pn3_dgu).sum(-1)               # [K]
+        alpha_A_dgu = (-(coef * coef) * bg_fn * bh_fn
+                       * pn3_norm_sq.unsqueeze(1)) / A_m_sqrt_dgu  # [K, M]
+        factor_III = self.friction * dt * vmask_a * alpha_A_dgu     # [K, M]
+        pn3_Jt_a = torch.einsum('kc,kmci->kmi', pn3_dgu, J_t_a)     # [K, M, n]
+        rel_over_s_xyz = rel_vel * inv_s.unsqueeze(2)               # [K, M, 3]
+        dgu_3 = dgu_3 - torch.einsum(
+            'km,kmc,kmj->kcj', factor_III, rel_over_s_xyz, pn3_Jt_a)
 
         h_dgu = (rel_vel * r_nx_dgu).sum(dim=2)
         omv = omega_stack_dgu.view(K, 1, 1)
@@ -2648,6 +2693,13 @@ class ConvexHullPBADSimulator:
                                + torch.einsum('kmc,kmcj->kj',
                                                 d_gom_dvb[lnk_idx],
                                                 J_t[lid_b_lnk]))
+
+        # TERM III (ω): A_m chain on the ω component of g_u
+        #   g_u_om = -∑ μ·dt·A_m·vmask · (h/s)
+        # ⇒ ∂g_u_om/∂θ_t (A_m chain) = -∑ μ·dt·vmask·(h/s) · α_A·(pn3·J_t_a)
+        h_over_s = h_dgu * inv_s                                    # [K, M]
+        dgu_om = dgu_om - torch.einsum(
+            'km,km,kmj->kj', factor_III, h_over_s, pn3_Jt_a)
 
         dgu_4 = torch.zeros(K, 4, n, device=dev, dtype=dty)
         dgu_4[:, :3, :] = dgu_3
@@ -2757,6 +2809,19 @@ class ConvexHullPBADSimulator:
 
         if K > 0 and dgu_dt is not None:
             rhs_full[n + K*4 : n + K*4 + K*3, :n] = dgu_dt.reshape(K*3, n)
+
+        # (p, u)-rows × d-column of the IFT RHS — required so ``dtheta_dd``
+        # equals the **true** ``dθ*/dd``.  LM jointly solves (θ, p, u), so all
+        # three rows of ``∂g/∂d`` are needed; dropping ``HpD/HuD`` gives only
+        # the Schur-reduced "θ-response with (p, u) frozen", which differs
+        # from the FD-measured ``dθ*/dd`` by ``H_bar⁻¹·B·D⁻¹·[HpD; HuD]·dc``.
+        if K > 0:
+            HpD = self._compute_HpD(theta_star, wv_star, manifolds)
+            rhs_full[n : n + K * 4, 3 * n:] = HpD
+            HuD = self._compute_HuD(
+                theta_star, theta_t, wv_star, wv_curr,
+                manifolds, p_normals, u_tangents=u_tangents)
+            rhs_full[n + K * 4 : n + K * 4 + K * 3, 3 * n:] = HuD
 
         try:
             sol = -torch.linalg.solve(H_full, rhs_full)
@@ -3175,6 +3240,260 @@ class ConvexHullPBADSimulator:
                 g_v.index_add_(0, lid_b[lnk_idx], -g_fric_s[lnk_idx])
 
         return g_v
+
+    @staticmethod
+    def _skew(v: torch.Tensor) -> torch.Tensor:
+        """Skew-symmetric matrix ``S(v)`` such that ``S(v)·w = v × w``.
+
+        ``v`` : ``[K, 3]`` → returns ``[K, 3, 3]``.
+        """
+        K = v.shape[0]
+        dev, dty = v.device, v.dtype
+        S = torch.zeros(K, 3, 3, device=dev, dtype=dty)
+        S[:, 0, 1] = -v[:, 2]
+        S[:, 0, 2] =  v[:, 1]
+        S[:, 1, 0] =  v[:, 2]
+        S[:, 1, 2] = -v[:, 0]
+        S[:, 2, 0] = -v[:, 1]
+        S[:, 2, 1] =  v[:, 0]
+        return S
+
+    # HpD: ∂g_p/∂d_local — contact-barrier cross-Hessian, [4*K, L*mM*3].
+    # Mirrors section (B) of :meth:`_compute_HThetaD` but contracts with
+    # R (= ∂va/∂d_local) in place of J (= ∂va/∂θ).  ``g_p`` is contact-
+    # barrier only (friction enters via ``g_u`` / ``H_uu``), and ``g_p_n``
+    # (‖p‖-normalization) is independent of d_local → no friction section.
+    def _compute_HpD(self, theta_star, wv_star, manifolds):
+        """``∂g_p/∂d_local``.  Returns ``[4·K, L·mM·3]``."""
+        dev, dty = self.device, self.dtype
+        L, mM = self._L, self._max_M
+        coef = self.coef_barrier
+        x0 = self.x0
+        vmask = self._vert_mask_float
+        K = len(manifolds)
+
+        if K == 0:
+            return torch.zeros(0, L * mM * 3, device=dev, dtype=dty)
+
+        p_stack = torch.stack([m.p.detach() for m in manifolds])
+        p3 = p_stack[:, :3]
+        lid = torch.tensor([m.link_a for m in manifolds],
+                           device=dev, dtype=torch.long)
+        lid_b = torch.tensor([m.link_b for m in manifolds],
+                             device=dev, dtype=torch.long)
+        is_ground = (lid_b < 0)
+        lnk_idx = (~is_ground).nonzero(as_tuple=True)[0]
+
+        with torch.no_grad():
+            T_star = torch.stack(
+                self.robot.forward_kinematics(theta_star.detach()))
+        R_star = T_star[:, :3, :3]
+
+        HpD = torch.zeros(K, 4, L, mM, 3, device=dev, dtype=dty)
+
+        # ==================  A side  ==================
+        va_h = torch.cat([wv_star[lid],
+                          torch.ones(K, mM, 1, device=dev, dtype=dty)], 2)
+        d_a = -torch.einsum('kmi,ki->km', va_h, p_stack)
+        _, bg_a, bh_a = barrier_eval(d_a, x0, self._barrier_d0_half)
+        mask_a = vmask[lid]
+        bg_m = bg_a * mask_a
+        bh_m = bh_a * mask_a
+        R_A = R_star[lid]
+        Rtp3 = torch.einsum('kjc,kj->kc', R_A, p3)
+
+        # Direct (∂va_h_xyz/∂d, p-cmpt i ∈ {0,1,2}):  -coef · bg_m · R_A[i, c]
+        # Curvature (∂bg/∂d, all i):  +coef · bh_m · Rtp3[c] · va_h[i]
+        # Two negatives (-coef from g_p_a, -p3 from ∂d_a/∂va_h) cancel.
+        direct_a_3 = -coef * torch.einsum('km,kij->kimj', bg_m, R_A)
+        direct_a = torch.zeros(K, 4, mM, 3, device=dev, dtype=dty)
+        direct_a[:, :3, :, :] = direct_a_3
+        curv_a = coef * torch.einsum('km,kj,kmi->kimj', bh_m, Rtp3, va_h)
+        HpD[torch.arange(K, device=dev), :, lid, :, :] += direct_a + curv_a
+
+        # ===================  B side (link-link only)  ===================
+        if lnk_idx.numel() > 0:
+            lid_b_lnk = lid_b[lnk_idx]
+            p_lnk = p_stack[lnk_idx]
+            p3_lnk = p3[lnk_idx]
+            K_lnk = lnk_idx.numel()
+
+            vb_h = torch.cat([wv_star[lid_b_lnk],
+                              torch.ones(K_lnk, mM, 1, device=dev, dtype=dty)], 2)
+            d_b = torch.einsum('kmi,ki->km', vb_h, p_lnk)
+            _, bg_b, bh_b = barrier_eval(d_b, x0, self._barrier_d0_half)
+            mask_b = vmask[lid_b_lnk]
+            bg_m_b = bg_b * mask_b
+            bh_m_b = bh_b * mask_b
+            R_B = R_star[lid_b_lnk]
+            Rtp3_b = torch.einsum('kjc,kj->kc', R_B, p3_lnk)
+
+            # B-side: +coef and ∂d_b/∂vb_h_xyz = +p3 (signs combine to +).
+            direct_b_3 = coef * torch.einsum('km,kij->kimj', bg_m_b, R_B)
+            direct_b = torch.zeros(K_lnk, 4, mM, 3, device=dev, dtype=dty)
+            direct_b[:, :3, :, :] = direct_b_3
+            curv_b = coef * torch.einsum('km,kj,kmi->kimj', bh_m_b, Rtp3_b, vb_h)
+            HpD[lnk_idx, :, lid_b_lnk, :, :] += direct_b + curv_b
+
+        return HpD.reshape(K * 4, L * mM * 3)
+
+    # HuD: ∂g_u/∂d_local — friction-velocity cross-Hessian, [3*K, L*mM*3].
+    # Mirrors :meth:`_compute_dgu_dtheta_t` (upstream's ∂g_u/∂θ_t) but
+    # routes through ``∂va/∂d_local = R`` instead of ``∂va/∂θ = J``.  Chains:
+    #   (1) A_m via va_curr → bg_fn          (∂A_m/∂d_a)
+    #   (2) rel_vel via (va_next, va_curr, vb_next, vb_curr)
+    #   (3) r_nx via va_curr                 (only body a)
+    # ``p_normals`` MUST be the friction-plane snap, NOT converged ``m.p``.
+    def _compute_HuD(self, theta_star, theta_t, wv_star, wv_curr,
+                     manifolds, p_normals, u_tangents=None):
+        """``∂g_u/∂d_local``.  Returns ``[3·K, L·mM·3]``; zeros if no friction."""
+        dev, dty = self.device, self.dtype
+        L, mM = self._L, self._max_M
+        dt = self.dt
+        coef = self.coef_barrier
+        x0 = self.x0
+        vmask = self._vert_mask_float
+        K = len(manifolds)
+
+        if K == 0 or not self._use_friction:
+            return torch.zeros(3 * K, L * mM * 3, device=dev, dtype=dty)
+
+        pn_stack = torch.stack(p_normals)
+        u_stack = (torch.stack(u_tangents) if u_tangents is not None
+                   else torch.stack([m.u.detach() for m in manifolds]))
+        lid = torch.tensor([m.link_a for m in manifolds],
+                           device=dev, dtype=torch.long)
+        lid_b = torch.tensor([m.link_b for m in manifolds],
+                             device=dev, dtype=torch.long)
+        is_ground = (lid_b < 0)
+        lnk_idx = (~is_ground).nonzero(as_tuple=True)[0]
+
+        with torch.no_grad():
+            T_star = torch.stack(
+                self.robot.forward_kinematics(theta_star.detach()))
+            T_t = torch.stack(
+                self.robot.forward_kinematics(theta_t.detach()))
+        R_star = T_star[:, :3, :3]
+        R_t = T_t[:, :3, :3]
+
+        _eps_n = self._friction_eps_n
+        _eps_s = self._friction_eps_s
+
+        n_vecs = pn_stack[:, :3]
+        norm_n = torch.norm(n_vecs, dim=1, keepdim=True) + _eps_n
+        n_hat = n_vecs / norm_n
+        Proj = self._eye3.unsqueeze(0) - n_hat.unsqueeze(2) * n_hat.unsqueeze(1)
+        u_xyz, omega, t0_mh, t1_mh = self._unified_u_to_xyz_omega(u_stack, n_hat)
+
+        va_next = wv_star[lid]
+        va_curr = wv_curr[lid]
+        ones_K1 = torch.ones(K, mM, 1, device=dev, dtype=dty)
+        mask_a = vmask[lid]
+        R_t_a = R_t[lid]
+
+        vel = (va_next - va_curr) / dt
+        if lnk_idx.numel() > 0:
+            lid_b_lnk = lid_b[lnk_idx]
+            vel[lnk_idx] = (vel[lnk_idx]
+                            - (wv_star[lid_b_lnk] - wv_curr[lid_b_lnk]) / dt)
+        tan_vel = torch.einsum('kij,kmj->kmi', Proj, vel)
+        r_nx = torch.cross(n_hat.unsqueeze(1), va_curr, dim=2)
+        rel_vel = tan_vel - u_xyz.unsqueeze(1) - omega.view(K, 1, 1) * r_nx
+
+        # A_m = sqrt(fn_sq + eps_s) − sqrt(eps_s),  fn_sq = (coef·bg_fn)²·‖pn3‖²
+        va_h_fn = torch.cat([va_curr, ones_K1], dim=2)
+        d_fn = -torch.einsum('kmi,ki->km', va_h_fn, pn_stack)
+        _, bg_fn, bh_fn = barrier_eval(d_fn, x0, self._barrier_d0_half)
+        pn3 = pn_stack[:, :3]
+        pn3_norm_sq = pn3.pow(2).sum(dim=1)
+        fn_sq = (coef * bg_fn).pow(2) * pn3_norm_sq.unsqueeze(1)
+        sqrt_fn = torch.sqrt(fn_sq + _eps_s)
+        A_m = sqrt_fn - self._sqrt_friction_eps_s
+
+        # ∂A_m/∂va_curr_xyz = -coef²·bg·bh·pn3·‖pn3‖²/sqrt_fn
+        coef_factor = -(coef * coef) * bg_fn * bh_fn * \
+            pn3_norm_sq.unsqueeze(1) / sqrt_fn
+        dAm_dvac = coef_factor.unsqueeze(2) * pn3.unsqueeze(1)
+        dAm_dd_a = torch.einsum('kmc,kcj->kmj', dAm_dvac, R_t_a)
+
+        # D_rv_a = Proj · (R*_a − R_t_a)/dt  −  ω · skew(n̂) · R_t_a
+        # D_rv_b = -Proj · (R*_b − R_t_b)/dt   (link case; no r_nx contribution)
+        dR_eff_a = (R_star[lid] - R_t_a) / dt
+        dR_nx_a = torch.einsum('kij,kjc->kic', self._skew(n_hat), R_t_a)
+        D_rv_a = (torch.einsum('kij,kjc->kic', Proj, dR_eff_a)
+                  - omega.view(K, 1, 1) * dR_nx_a)
+
+        s_norm = torch.sqrt(rel_vel.pow(2).sum(2) + _eps_s)
+        inv_s = 1.0 / (s_norm + 1e-30)
+        inv_s3 = inv_s.pow(3)
+        rel_over_s = rel_vel * inv_s.unsqueeze(2)
+        h_mh = (rel_vel * r_nx).sum(dim=2)
+        c_mh = self.friction * dt * A_m * mask_a
+        A_term_a = self.friction * dt * mask_a
+
+        rv_dot_Drv_a = torch.einsum('kmc,kcj->kmj', rel_vel, D_rv_a)
+        # M_rv_a[c, c'] = inv_s · D_rv_a[c, c'] − inv_s³ · rv[c] · (rv·D_rv_a)[c']
+        M_rv_a = (inv_s.unsqueeze(2).unsqueeze(3) * D_rv_a.unsqueeze(1)
+                  - inv_s3.unsqueeze(2).unsqueeze(3)
+                    * rel_vel.unsqueeze(3) * rv_dot_Drv_a.unsqueeze(2))
+
+        # ∂g_u3[c]/∂d_a = -friction·dt·mask·{ A-chain + A_m · M_rv_a }
+        A_chain_xyz_a = (A_term_a.unsqueeze(2).unsqueeze(3)
+                         * rel_over_s.unsqueeze(3)
+                         * dAm_dd_a.unsqueeze(2))
+        rv_chain_xyz_a = c_mh.unsqueeze(2).unsqueeze(3) * M_rv_a
+        dg_xyz_dd_a = -(A_chain_xyz_a + rv_chain_xyz_a)
+
+        # ∂g_om/∂d_a = -A_term·dAm·h·inv_s
+        #              - c_mh·inv_s·(r_nx·D_rv_a + rv·dR_nx_a)
+        #              + c_mh·h·inv_s³·(rv·D_rv_a)
+        rnx_dot_Drv_a = torch.einsum('kmc,kcj->kmj', r_nx, D_rv_a)
+        rv_dot_dRnx_a = torch.einsum('kmc,kcj->kmj', rel_vel, dR_nx_a)
+        dg_om_dd_a = (-(A_term_a * h_mh * inv_s).unsqueeze(2) * dAm_dd_a
+                      - (c_mh * inv_s).unsqueeze(2)
+                        * (rnx_dot_Drv_a + rv_dot_dRnx_a)
+                      + (c_mh * h_mh * inv_s3).unsqueeze(2) * rv_dot_Drv_a)
+
+        # Body b (link case): no A_m chain, no dR_nx — only D_rv_b through rel_vel.
+        if lnk_idx.numel() > 0:
+            R_t_b = R_t[lid_b_lnk]
+            D_rv_b = -torch.einsum(
+                'kij,kjc->kic', Proj[lnk_idx],
+                (R_star[lid_b_lnk] - R_t_b) / dt)
+
+            rel_vel_l = rel_vel[lnk_idx]
+            r_nx_l = r_nx[lnk_idx]
+            inv_s_l = inv_s[lnk_idx]
+            inv_s3_l = inv_s3[lnk_idx]
+            h_mh_l = h_mh[lnk_idx]
+            c_mh_l = c_mh[lnk_idx]
+
+            rv_dot_Drv_b = torch.einsum('kmc,kcj->kmj', rel_vel_l, D_rv_b)
+            M_rv_b = (inv_s_l.unsqueeze(2).unsqueeze(3) * D_rv_b.unsqueeze(1)
+                      - inv_s3_l.unsqueeze(2).unsqueeze(3)
+                        * rel_vel_l.unsqueeze(3) * rv_dot_Drv_b.unsqueeze(2))
+            dg_xyz_dd_b = -c_mh_l.unsqueeze(2).unsqueeze(3) * M_rv_b
+
+            rnx_dot_Drv_b = torch.einsum('kmc,kcj->kmj', r_nx_l, D_rv_b)
+            dg_om_dd_b = (-(c_mh_l * inv_s_l).unsqueeze(2) * rnx_dot_Drv_b
+                          + (c_mh_l * h_mh_l * inv_s3_l).unsqueeze(2)
+                            * rv_dot_Drv_b)
+
+        # Assemble [K, 4, L, mM, 3] (xyz=0..2, ω=3) then reduce with J_lift.
+        dg4 = torch.zeros(K, 4, L, mM, 3, device=dev, dtype=dty)
+        contrib_a4 = torch.cat([dg_xyz_dd_a.permute(0, 2, 1, 3).contiguous(),
+                                dg_om_dd_a.unsqueeze(1)], dim=1)
+        dg4[torch.arange(K, device=dev), :, lid, :, :] += contrib_a4
+
+        if lnk_idx.numel() > 0:
+            contrib_b4 = torch.cat([dg_xyz_dd_b.permute(0, 2, 1, 3).contiguous(),
+                                    dg_om_dd_b.unsqueeze(1)], dim=1)
+            dg4[lnk_idx, :, lid_b_lnk, :, :] += contrib_b4
+
+        # HuD[k, i_3, l, m, c'] = J_lift^T · dg4[k, :, l, m, c']
+        J_mh = self._friction_J_lift(t0_mh, t1_mh)
+        return torch.einsum('kji,kjlmc->kilmc', J_mh, dg4) \
+                    .reshape(3 * K, L * mM * 3)
 
     # FK correction for vertex design derivatives: (∂J/∂d)^T @ g_v
     def _compute_fk_correction_d(self, J, g_v, theta, wv):
@@ -3743,9 +4062,21 @@ class ConvexHullPBADSimulator:
             try:
                 self._local_verts = base_d.clone()
                 self._restore_pair_manifolds(snap_conv)
+                # CRITICAL: pass the SAME initial_manifolds as the reference
+                # solve (line ~3981 uses ``initial_manifolds=manifolds``, which
+                # is the source of ``mf_step_entry``).  Otherwise ``step()``
+                # falls into ``_detect_contacts(theta=theta_init=theta_star)``
+                # and builds ``friction_plane_snap`` from manifolds detected
+                # at θ*, while the ANA/AD paths use ``fps_dbg`` derived from
+                # ``mf_step_entry`` (manifolds at θ_t).  The two snaps differ
+                # when friction is active → FD probes solve a DIFFERENT KKT
+                # system than ANA, producing O(few) |FD-AD| errors that
+                # vanish only when friction is disabled.
+                mf_init = self._clone_manifolds(mf_step_entry)
                 th, _, _ = self.step(
                     tt, tm1, pd_, kp, kd,
-                    theta_init=theta_init)
+                    theta_init=theta_init,
+                    initial_manifolds=mf_init)
             finally:
                 self.gtol = saved_gtol
                 self._alpha = sa
@@ -3874,9 +4205,16 @@ class ConvexHullPBADSimulator:
             try:
                 self._local_verts = d_pert.clone()
                 self._restore_pair_manifolds(snap_conv)
+                # CRITICAL: same friction-snap consistency fix as ``fd_solve``.
+                # Without ``initial_manifolds=mf_step_entry`` the perturbed
+                # solve detects manifolds at θ* and snaps friction planes
+                # there, producing a DIFFERENT KKT system than the ANA/AD
+                # IFT linearization (which uses ``fps_dbg`` built from θ_t).
+                mf_init_xl = self._clone_manifolds(mf_step_entry)
                 th_p_ddxl, _, _ = self.step(
                     theta_t, theta_tm1, pd_target, kp, kd,
-                    theta_init=theta_star)
+                    theta_init=theta_star,
+                    initial_manifolds=mf_init_xl)
             finally:
                 self.gtol = saved_gtol
                 self._alpha = sa
@@ -4141,17 +4479,26 @@ class ConvexHullPBADSimulator:
                         "DTDXL-RHS triple (∂(∇E)/∂d·dc)",
                         b_dd, fd_rhs_x, b_ag_x)
 
-                    # Augmented RHS must match :meth:`_backward_normal`:
-                    #   R = [b_ag_x ; HpD·dc ; HuD·dc]
-                    # ``gi.dtheta_dd`` itself was solved with HpD/HuD in the
-                    # (p, u) rows.  Zero-padding them in this AD reference path
-                    # produces a spurious ANA-vs-AD gap = H_full^{-1}·[0; HpD·dc;
-                    # HuD·dc] that has nothing to do with whether
-                    # ``_jvp_grad_theta_wrt_local_verts_autograd`` is correct.
-                    # Mixing AD on θ-row with ANA on (p, u)-rows isolates the
-                    # θ-row check (RHS triple above already validates it).
+                    # Augmented RHS matches :meth:`_backward_normal`:
+                    #     R_x = [b_ag_x ; HpD·dc ; HuD·dc]
+                    # ``gi.dtheta_dd`` is solved with HpD/HuD on the (p, u)
+                    # rows (see ``_backward_normal``).  To keep the AD
+                    # reference consistent with the ANA path, we must fill
+                    # the same (p, u) rows here; mixing AD on θ-row with
+                    # ANA on (p, u)-rows isolates whether
+                    # ``_jvp_grad_theta_wrt_local_verts_autograd`` (the
+                    # θ-row jacobian) is correct.  The RHS triple above
+                    # already validates the θ-row directly.
                     R_x = torch.zeros(dim_h, device=dev, dtype=dty)
                     R_x[:n] = b_ag_x
+                    if K_h > 0:
+                        HpD_h = self._compute_HpD(
+                            theta_star, wv_s_ift, mf_h)
+                        HuD_h = self._compute_HuD(
+                            theta_star, theta_t, wv_s_ift, wv_cu,
+                            mf_h, pn_fric_h, u_tangents=un_h)
+                        R_x[n : n + K_h * 4] = HpD_h @ dc
+                        R_x[n + K_h * 4 : n + K_h * 4 + K_h * 3] = HuD_h @ dc
                     ag_x = _solve_r(R_x)[:n]
                     cmp_x = (gi.dtheta_dd @ dc).detach()
                     assert th_p_ddxl is not None

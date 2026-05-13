@@ -119,15 +119,15 @@ def _batch_initial_theta_spread_root_y(
 # =====================================================================
 
 def debug(xml_path, device='cpu', *, use_random=False, scale=0.1,
-          warmup_steps=30, render=False,
+          warmup_steps=40, render=False,
           # selectors
           energy_only: bool = False,
           xl: bool = False,
           xl_only: bool = False,
           # XL tuning
-          xl_gtol: float = 1e-7,
+          xl_gtol: float = 1e-4,
           xl_max_iter: int = 2000,
-          xl_delta: float = 1e-6,
+          xl_delta: float = 1e-4,
           xl_trials: int = 3,
           xl_head: int = 8,
           xl_seed: int = 0,
